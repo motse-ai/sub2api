@@ -2,6 +2,7 @@ package routes
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
@@ -10,6 +11,33 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// handleAnthropicMessages strips the /anthropic prefix and dispatches to
+// the internal Messages handler, which uses apicompat to translate between
+// Anthropic Messages format and OpenAI Chat Completions/Responses format.
+// This eliminates the need for an external Claude Code Router proxy.
+func handleAnthropicMessages(h *handler.Handlers) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Strip /anthropic prefix so the handler sees clean /v1/messages etc.
+		c.Request.URL.Path = c.Param("path")
+		if c.Request.URL.Path == "" {
+			c.Request.URL.Path = "/"
+		}
+		switch {
+		case strings.HasPrefix(c.Request.URL.Path, "/v1/messages"):
+			if getGroupPlatform(c) == service.PlatformOpenAI {
+				h.OpenAIGateway.Messages(c)
+				return
+			}
+			h.Gateway.Messages(c)
+		default:
+			c.JSON(http.StatusNotFound, gin.H{
+				"type":  "error",
+				"error": gin.H{"type": "not_found_error", "message": "Unknown anthropic path"},
+			})
+		}
+	}
+}
 
 // RegisterGatewayRoutes 注册 API 网关路由（Claude/OpenAI/Gemini 兼容）
 func RegisterGatewayRoutes(
@@ -295,6 +323,11 @@ func RegisterGatewayRoutes(
 
 	// Antigravity 模型列表
 	r.GET("/antigravity/models", gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.Gateway.AntigravityModels)
+
+	// Anthropic API Messages — uses internal apicompat translation (Anthropic ↔ OpenAI)
+	// instead of proxying to an external Claude Code Router.
+	r.Any("/anthropic", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, handleAnthropicMessages(h))
+	r.Any("/anthropic/*path", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, handleAnthropicMessages(h))
 
 	// Antigravity 专用路由（仅使用 antigravity 账户，不混合调度）
 	antigravityV1 := r.Group("/antigravity/v1")
