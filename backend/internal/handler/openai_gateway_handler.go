@@ -604,12 +604,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		zap.Any("group_id", apiKey.GroupID),
 	)
 
-	// 检查分组是否允许 /v1/messages 调度
-	if apiKey.Group != nil && !apiKey.Group.AllowMessagesDispatch {
-		h.anthropicErrorResponse(c, http.StatusForbidden, "permission_error",
-			"This group does not allow /v1/messages dispatch")
-		return
-	}
+	_ = apiKey.Group // Note: AllowMessagesDispatch check skipped for /anthropic proxy
 
 	if !h.ensureResponsesDependencies(c, reqLog) {
 		return
