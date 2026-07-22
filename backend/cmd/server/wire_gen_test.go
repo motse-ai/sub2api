@@ -40,6 +40,7 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 		nil,
 	)
 	accountExpirySvc := service.NewAccountExpiryService(nil, time.Second)
+	proxyExpirySvc := service.NewProxyExpiryService(nil, time.Second)
 	subscriptionExpirySvc := service.NewSubscriptionExpiryService(nil, time.Second)
 	pricingSvc := service.NewPricingService(cfg, nil)
 	emailQueueSvc := service.NewEmailQueueService(nil, 1)
@@ -57,12 +58,19 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 		&service.OpsCleanupService{},
 		&service.OpsScheduledReportService{},
 		opsSystemLogSinkSvc,
+		nil, // opsService
+		nil, // opsIngressRejectAggregator
+		nil, // apiKeyService
+		nil, // authCacheInvalidationWorker
 		schedulerSnapshotSvc,
 		tokenRefreshSvc,
 		accountExpirySvc,
+		proxyExpirySvc,
 		subscriptionExpirySvc,
 		&service.UsageCleanupService{},
 		idempotencyCleanupSvc,
+		&service.BatchImageCleanupService{},
+		nil, // batchImageWorker
 		pricingSvc,
 		emailQueueSvc,
 		billingCacheSvc,
@@ -72,12 +80,16 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 		openAIOAuthSvc,
 		geminiOAuthSvc,
 		antigravityOAuthSvc,
+		nil, // grokOAuth
 		nil, // openAIGateway
 		nil, // scheduledTestRunner
 		nil, // backupSvc
 		nil, // paymentOrderExpiry
 		nil, // channelMonitorRunner
 		nil, // quotaFlusher
+		nil, // upstreamBillingProbe
+		nil, // auditLog
+		nil, // promptAudit
 	)
 
 	require.NotPanics(t, func() {
