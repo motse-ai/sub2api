@@ -131,9 +131,9 @@ func TestAnthropicToChatCompletionsRequest_ToolResultBecomesToolMessage(t *testi
 	require.Equal(t, `"sunny, 72F"`, string(toolMsg.Content))
 }
 
-func TestAnthropicToChatCompletionsRequest_ThinkingDropped(t *testing.T) {
+func TestAnthropicToChatCompletionsRequest_ThinkingBecomesReasoningContent(t *testing.T) {
 	req := &AnthropicRequest{
-		Model:     "claude-sonnet-4-20250514",
+		Model:     "deepseek-v4-flash",
 		MaxTokens: 100,
 		Messages: []AnthropicMessage{
 			{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"secret thoughts"},{"type":"text","text":"answer"}]`)},
@@ -143,8 +143,38 @@ func TestAnthropicToChatCompletionsRequest_ThinkingDropped(t *testing.T) {
 	out, err := AnthropicToChatCompletionsRequest(req)
 	require.NoError(t, err)
 	require.Len(t, out.Messages, 1)
-	// Only text survives; thinking is dropped
 	require.Equal(t, `"answer"`, string(out.Messages[0].Content))
+	require.Equal(t, "secret thoughts", out.Messages[0].ReasoningContent)
+}
+
+func TestAnthropicToChatCompletionsRequest_ThinkingOnToolCallBecomesReasoningContent(t *testing.T) {
+	// DeepSeek thinking mode 400s unless the reasoning_content that produced a
+	// tool call is replayed on that assistant message. Claude Code round-trips
+	// it as an Anthropic thinking block; the Chat Completions bridge must put
+	// it back on reasoning_content rather than dropping it.
+	req := &AnthropicRequest{
+		Model:     "deepseek-v4-flash",
+		MaxTokens: 100,
+		Messages: []AnthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"check weather"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"need to call get_weather"},{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"SF"}}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"toolu_1","content":"sunny"}]`)},
+		},
+	}
+
+	out, err := AnthropicToChatCompletionsRequest(req)
+	require.NoError(t, err)
+
+	var assistant *ChatMessage
+	for i := range out.Messages {
+		if out.Messages[i].Role == "assistant" && len(out.Messages[i].ToolCalls) > 0 {
+			assistant = &out.Messages[i]
+		}
+	}
+	require.NotNil(t, assistant, "assistant tool-call message should survive")
+	require.Equal(t, "need to call get_weather", assistant.ReasoningContent)
+	require.Len(t, assistant.ToolCalls, 1)
+	require.Equal(t, "get_weather", assistant.ToolCalls[0].Function.Name)
 }
 
 func TestAnthropicToChatCompletionsRequest_ToolChoiceAuto(t *testing.T) {

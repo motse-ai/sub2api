@@ -421,6 +421,22 @@ func extractAnthropicTextFromBlocks(blocks []AnthropicContentBlock) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// extractAnthropicThinkingFromBlocks joins thinking-block text so it can be
+// replayed as Chat Completions reasoning_content. Empty / whitespace-only
+// thinking is skipped.
+func extractAnthropicThinkingFromBlocks(blocks []AnthropicContentBlock) string {
+	var parts []string
+	for _, b := range blocks {
+		if b.Type != "thinking" {
+			continue
+		}
+		if t := strings.TrimSpace(b.Thinking); t != "" {
+			parts = append(parts, t)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
 // mapAnthropicEffortToResponses converts Anthropic reasoning effort levels to
 // OpenAI Responses API effort levels.
 //

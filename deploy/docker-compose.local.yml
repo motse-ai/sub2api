@@ -24,9 +24,16 @@ services:
   # Sub2API Application
   # ===========================================================================
   sub2api:
-    image: weishaw/sub2api:latest
+    # Local source build with /anthropic Messages dispatch. Do not replace with
+    # weishaw/sub2api:* — upstream releases lack this route and Claude Code will
+    # get HTML (HTTP 200 malformed). Also keep rootfs read-only so the admin
+    # GitHub "online update" cannot overwrite /app/sub2api in-place.
+    image: sub2api:0.1.179-anthropic
     container_name: sub2api
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
     security_opt:
       - no-new-privileges:true
     ulimits:

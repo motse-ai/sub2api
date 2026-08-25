@@ -249,8 +249,10 @@ func anthropicUserToChatMessages(raw json.RawMessage) ([]ChatMessage, error) {
 
 // anthropicAssistantToChatMessages handles an Anthropic assistant message.
 // Text content → assistant message content; tool_use blocks → tool_calls on the
-// same assistant message; thinking blocks are dropped (Chat Completions has no
-// inbound thinking field, matching anthropicAssistantToResponses).
+// same assistant message; thinking blocks → reasoning_content so DeepSeek-style
+// thinking mode can replay the reasoning that produced a tool call. Dropping
+// them yields upstream 400 "reasoning_content in the thinking mode must be
+// passed back to the API".
 func anthropicAssistantToChatMessages(raw json.RawMessage) ([]ChatMessage, error) {
 	// Plain string → single assistant message.
 	var s string
@@ -269,6 +271,9 @@ func anthropicAssistantToChatMessages(raw json.RawMessage) ([]ChatMessage, error
 	if text != "" {
 		content, _ := json.Marshal(text)
 		msg.Content = content
+	}
+	if thinking := extractAnthropicThinkingFromBlocks(blocks); thinking != "" {
+		msg.ReasoningContent = thinking
 	}
 
 	for _, b := range blocks {
