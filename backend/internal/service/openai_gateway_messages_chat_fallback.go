@@ -52,11 +52,14 @@ func (s *OpenAIGatewayService) forwardAnthropicViaRawChatCompletions(
 	clientStream := anthropicReq.Stream
 
 	// 2. Anthropic → Chat Completions (direct, no Responses intermediary)
-	chatReq, err := apicompat.AnthropicToChatCompletionsRequest(&anthropicReq)
+	chatReq, err := apicompat.AnthropicToChatCompletionsRequestWithOptions(&anthropicReq, &apicompat.AnthropicToChatCompletionsOptions{
+		ReasoningContentByToolUseID: s.reasoningContentByAnthropicToolUseID,
+	})
 	if err != nil {
 		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, fmt.Errorf("convert anthropic to chat completions: %w", err)
 	}
+	s.recacheAnthropicToolUseReasoningFromChatMessages(chatReq.Messages)
 
 	billingModel := resolveOpenAIForwardModel(account, anthropicReq.Model, defaultMappedModel)
 	upstreamModel := normalizeOpenAIModelForUpstream(account, billingModel)
@@ -137,6 +140,61 @@ func (s *OpenAIGatewayService) forwardAnthropicViaRawChatCompletions(
 	return s.bufferChatCompletionsAsAnthropic(c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 }
 
+const anthropicToolReasoningCachePrefix = "anthropic-tool:"
+
+func anthropicToolReasoningCacheKey(toolUseID string) string {
+	return anthropicToolReasoningCachePrefix + strings.TrimSpace(toolUseID)
+}
+
+func (s *OpenAIGatewayService) reasoningContentByAnthropicToolUseID(toolUseID string) string {
+	return s.reasoningContentByID(anthropicToolReasoningCacheKey(toolUseID))
+}
+
+func (s *OpenAIGatewayService) cacheAnthropicToolUseReasoning(toolUseIDs []string, content string) {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return
+	}
+	seen := make(map[string]struct{}, len(toolUseIDs))
+	for _, id := range toolUseIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		s.setReasoningContent(anthropicToolReasoningCacheKey(id), content)
+		if mapped := apicompat.ChatToolCallIDToAnthropicToolUseID(id); mapped != id {
+			s.setReasoningContent(anthropicToolReasoningCacheKey(mapped), content)
+		}
+	}
+}
+
+func (s *OpenAIGatewayService) recacheAnthropicToolUseReasoningFromChatMessages(messages []apicompat.ChatMessage) {
+	for _, msg := range messages {
+		if msg.Role != "assistant" || msg.ReasoningContent == "" || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		ids := make([]string, 0, len(msg.ToolCalls))
+		for _, tc := range msg.ToolCalls {
+			ids = append(ids, tc.ID)
+		}
+		s.cacheAnthropicToolUseReasoning(ids, msg.ReasoningContent)
+	}
+}
+
+func collectChatToolCallIDs(toolCalls []apicompat.ChatToolCall) []string {
+	ids := make([]string, 0, len(toolCalls))
+	for _, tc := range toolCalls {
+		if id := strings.TrimSpace(tc.ID); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 func (s *OpenAIGatewayService) bufferChatCompletionsAsAnthropic(
 	c *gin.Context,
 	resp *http.Response,
@@ -151,6 +209,10 @@ func (s *OpenAIGatewayService) bufferChatCompletionsAsAnthropic(
 	ccResp, usage, err := s.readCCUpstreamJSONResponse(c, resp, writeAnthropicError)
 	if err != nil {
 		return nil, err
+	}
+	if ccResp != nil && len(ccResp.Choices) > 0 {
+		msg := ccResp.Choices[0].Message
+		s.cacheAnthropicToolUseReasoning(collectChatToolCallIDs(msg.ToolCalls), msg.ReasoningContent)
 	}
 	anthropicResp := apicompat.ChatCompletionsResponseToAnthropic(ccResp, originalModel)
 
@@ -189,10 +251,22 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsAnthropic(
 
 	anthropicState := apicompat.NewChatCompletionsToAnthropicStreamState(originalModel)
 	clientDisconnected := false
+	var streamReasoning strings.Builder
+	var streamToolIDs []string
 
 	// 与 responses 兄弟不同：客户端断开后仍继续做事件转换（喂 anthropicState），
 	// 仅跳过写出，保证 finalize 阶段的 usage 汇总不受断开影响。
 	emitChunk := func(chunk *apicompat.ChatCompletionsChunk) {
+		if chunk != nil {
+			for _, choice := range chunk.Choices {
+				if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
+					streamReasoning.WriteString(*choice.Delta.ReasoningContent)
+				} else if choice.Delta.Reasoning != nil && *choice.Delta.Reasoning != "" {
+					streamReasoning.WriteString(*choice.Delta.Reasoning)
+				}
+				streamToolIDs = append(streamToolIDs, collectChatToolCallIDs(choice.Delta.ToolCalls)...)
+			}
+		}
 		// CC chunk → Anthropic events (direct, single state machine)
 		anthropicEvents := apicompat.ChatCompletionsChunkToAnthropicEvents(chunk, anthropicState)
 		if clientDisconnected {
@@ -215,6 +289,7 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsAnthropic(
 	}
 
 	scan := s.scanCCStream(c, resp, "openai messages chat fallback", requestID, startTime, emitChunk)
+	s.cacheAnthropicToolUseReasoning(streamToolIDs, streamReasoning.String())
 	usage := scan.Usage
 
 	if scan.Err != nil {

@@ -227,3 +227,64 @@ func TestAnthropicAssistantToChatMessages_PlainStringContentUnaffected(t *testin
 	require.Empty(t, msgs[0].ReasoningContent)
 	require.Equal(t, `"just text"`, string(msgs[0].Content))
 }
+
+const anthropicToolTurnWithoutThinking = `[
+	{"type":"text","text":"checking"},
+	{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"SF"}}
+]`
+
+// Claude Code (especially with CLAUDE_CODE_DISABLE_THINKING) often echoes
+// tool_use without the thinking block that produced it. DeepSeek still 400s
+// unless reasoning_content is restored from the previous upstream turn.
+func TestAnthropicToChatCompletionsRequest_ToolUseCacheRestoresDroppedThinking(t *testing.T) {
+	out, err := AnthropicToChatCompletionsRequestWithOptions(
+		anthropicAssistantMsg(t, anthropicToolTurnWithoutThinking),
+		&AnthropicToChatCompletionsOptions{
+			ReasoningContentByToolUseID: func(toolUseID string) string {
+				if toolUseID == "toolu_1" {
+					return "cached weather plan"
+				}
+				return ""
+			},
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "cached weather plan", reasoningOnFirstToolCall(out.Messages))
+}
+
+func TestAnthropicToChatCompletionsRequest_PlaintextThinkingWinsOverCache(t *testing.T) {
+	out, err := AnthropicToChatCompletionsRequestWithOptions(
+		anthropicAssistantMsg(t, anthropicThinkingToolTurn),
+		&AnthropicToChatCompletionsOptions{
+			ReasoningContentByToolUseID: func(string) string {
+				return "should not be used"
+			},
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, "user wants weather, call the tool", reasoningOnFirstToolCall(out.Messages))
+}
+
+func TestAnthropicToChatCompletionsRequest_CacheMissKeepsEmptyReasoning(t *testing.T) {
+	out, err := AnthropicToChatCompletionsRequestWithOptions(
+		anthropicAssistantMsg(t, anthropicToolTurnWithoutThinking),
+		&AnthropicToChatCompletionsOptions{
+			ReasoningContentByToolUseID: func(string) string { return "" },
+		},
+	)
+	require.NoError(t, err)
+	require.Empty(t, reasoningOnFirstToolCall(out.Messages))
+
+	legacy, err := AnthropicToChatCompletionsRequest(anthropicAssistantMsg(t, anthropicToolTurnWithoutThinking))
+	require.NoError(t, err)
+	require.Empty(t, reasoningOnFirstToolCall(legacy.Messages))
+}
+
+func reasoningOnFirstToolCall(msgs []ChatMessage) string {
+	for _, m := range msgs {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+			return m.ReasoningContent
+		}
+	}
+	return ""
+}
