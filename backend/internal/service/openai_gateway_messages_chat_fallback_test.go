@@ -617,3 +617,83 @@ func TestShouldForwardAnthropicMessagesViaRawChatCompletionsForPassback(t *testi
 		})
 	}
 }
+
+func TestForwardAsAnthropic_DeepSeekReinjectsCachedReasoningWhenClaudeDropsThinking(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{
+		"model":"deepseek-v4-flash",
+		"max_tokens":256,
+		"messages":[
+			{"role":"user","content":"what's the weather?"},
+			{"role":"assistant","content":[
+				{"type":"text","text":"checking"},
+				{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"SF"}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"sunny"}]}
+		],
+		"stream":false
+	}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"chatcmpl_ds","object":"chat.completion","model":"deepseek-v4.1-flash","choices":[{"index":0,"message":{"role":"assistant","content":"sunny in SF"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}`,
+		)),
+	}}
+	account := rawChatCompletionsTestAccount()
+	account.Name = "https://aiaaa.cc DeepSeek"
+	account.Extra = map[string]any{
+		openai_compat.ExtraKeyResponsesMode:      string(openai_compat.ResponsesSupportModeAuto),
+		openai_compat.ExtraKeyResponsesSupported: true,
+	}
+	account.Credentials["model_mapping"] = map[string]any{
+		"deepseek-v4-flash": "deepseek-v4.1-flash",
+	}
+
+	cache := &reasoningRecordingCache{
+		getResp: map[string]string{
+			"anthropic-tool:toolu_1": "user wants weather, call the tool",
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream, cache: cache}
+	_, err := svc.ForwardAsAnthropic(context.Background(), c, account, body, "", "")
+	require.NoError(t, err)
+	require.Equal(t, "http://upstream.example/v1/chat/completions", upstream.lastReq.URL.String())
+	require.Equal(t, "user wants weather, call the tool",
+		gjson.GetBytes(upstream.lastBody, "messages.1.reasoning_content").String(),
+		"Claude dropped thinking; gateway must restore reasoning_content from the tool_use cache")
+}
+
+func TestForwardAsAnthropic_DeepSeekCachesReasoningAgainstToolUseID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"weather?"}],"stream":false}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"chatcmpl_cache","object":"chat.completion","model":"deepseek-v4.1-flash","choices":[{"index":0,"message":{"role":"assistant","content":"checking","reasoning_content":"need the weather tool","tool_calls":[{"id":"toolu_weather","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"SF\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}`,
+		)),
+	}}
+	account := rawChatCompletionsTestAccount()
+	account.Extra = map[string]any{
+		openai_compat.ExtraKeyResponsesMode:      string(openai_compat.ResponsesSupportModeAuto),
+		openai_compat.ExtraKeyResponsesSupported: true,
+	}
+	cache := &reasoningRecordingCache{}
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream, cache: cache}
+	_, err := svc.ForwardAsAnthropic(context.Background(), c, account, body, "", "")
+	require.NoError(t, err)
+	require.Equal(t, "need the weather tool", cache.snapshotSets()["anthropic-tool:toolu_weather"])
+}

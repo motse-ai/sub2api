@@ -337,6 +337,13 @@ func toResponsesCallID(id string) string {
 	return id
 }
 
+// ChatToolCallIDToAnthropicToolUseID is the tool_use.id Claude Code will echo
+// on the next /v1/messages turn. Cache reasoning under this id so a dropped
+// thinking block can still restore reasoning_content.
+func ChatToolCallIDToAnthropicToolUseID(id string) string {
+	return fromResponsesCallID(id)
+}
+
 // fromResponsesCallID reverses old prefixed IDs while preserving current IDs.
 func fromResponsesCallID(id string) string {
 	if after, ok := strings.CutPrefix(id, "fc_"); ok {
