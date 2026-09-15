@@ -70,6 +70,12 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		// 不支持 Responses 的其他 APIKey 账号，均将 Messages 转为 CC。
 		return s.forwardAnthropicViaRawChatCompletions(ctx, c, account, body, defaultMappedModel)
 	}
+	// Responses 探针为 true 的 OpenAI 账号包着 DeepSeek/Kimi/GLM 时，仍要走 CC，
+	// 否则 thinking 回放会在工具轮 400。
+	if shouldForwardAnthropicMessagesViaRawChatCompletionsForPassback(account, body, defaultMappedModel) {
+		SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
+		return s.forwardAnthropicViaRawChatCompletions(ctx, c, account, body, defaultMappedModel)
+	}
 	SetActualOpenAIUpstreamEndpoint(c, openAIResponsesUpstreamEndpoint)
 
 	startTime := time.Now()
@@ -1382,4 +1388,25 @@ func copyOpenAIUsageFromResponsesUsage(usage *apicompat.ResponsesUsage) OpenAIUs
 		result.CacheReadInputTokens = usage.InputTokensDetails.CachedTokens
 	}
 	return result
+}
+
+// shouldForwardAnthropicMessagesViaRawChatCompletionsForPassback forces
+// /v1/messages through Anthropic→Chat Completions when the resolved upstream
+// model requires thinking passback (DeepSeek, Kimi, GLM, …).
+//
+// OpenAI-platform accounts that wrap those models often have
+// Extra.openai_responses_supported=true from a probe. The Responses bridge
+// drops unsigned thinking blocks, so the next tool turn 400s with
+// "reasoning_content in the thinking mode must be passed back". The Chat
+// Completions bridge already folds thinking → reasoning_content.
+func shouldForwardAnthropicMessagesViaRawChatCompletionsForPassback(account *Account, body []byte, defaultMappedModel string) bool {
+	requested := NormalizeOpenAICompatRequestedModel(gjson.GetBytes(body, "model").String())
+	if requested == "" {
+		requested = NormalizeOpenAICompatRequestedModel(defaultMappedModel)
+	}
+	billing := resolveOpenAIForwardModel(account, requested, defaultMappedModel)
+	upstream := normalizeOpenAIModelForUpstream(account, billing)
+	return ResolveThinkingProtocol(upstream) == ThinkingProtocolPassbackRequired ||
+		ResolveThinkingProtocol(billing) == ThinkingProtocolPassbackRequired ||
+		ResolveThinkingProtocol(requested) == ThinkingProtocolPassbackRequired
 }
