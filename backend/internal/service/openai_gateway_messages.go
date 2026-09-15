@@ -54,7 +54,9 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 
 	// 固定 chat_completions 的 CN 账号，以及不支持 Responses 的其他 APIKey
 	// 账号，均将 Messages 转为 CC；固定 responses 的 CN 账号不受探针旧值覆盖。
-	if shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
+	if shouldForwardOpenAIResponsesViaRawChatCompletions(account) ||
+		shouldForwardAnthropicMessagesViaRawChatCompletionsForPassback(account, body, defaultMappedModel) {
+		SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
 		return s.forwardAnthropicViaRawChatCompletions(ctx, c, account, body, defaultMappedModel)
 	}
 
@@ -1362,4 +1364,25 @@ func copyOpenAIUsageFromResponsesUsage(usage *apicompat.ResponsesUsage) OpenAIUs
 		result.CacheReadInputTokens = usage.InputTokensDetails.CachedTokens
 	}
 	return result
+}
+
+// shouldForwardAnthropicMessagesViaRawChatCompletionsForPassback forces
+// /v1/messages through Anthropic→Chat Completions when the resolved upstream
+// model requires thinking passback (DeepSeek, Kimi, GLM, …).
+//
+// OpenAI-platform accounts that wrap those models often have
+// Extra.openai_responses_supported=true from a probe. The Responses bridge
+// drops unsigned thinking blocks, so the next tool turn 400s with
+// "reasoning_content in the thinking mode must be passed back". The Chat
+// Completions bridge already folds thinking → reasoning_content.
+func shouldForwardAnthropicMessagesViaRawChatCompletionsForPassback(account *Account, body []byte, defaultMappedModel string) bool {
+	requested := NormalizeOpenAICompatRequestedModel(gjson.GetBytes(body, "model").String())
+	if requested == "" {
+		requested = NormalizeOpenAICompatRequestedModel(defaultMappedModel)
+	}
+	billing := resolveOpenAIForwardModel(account, requested, defaultMappedModel)
+	upstream := normalizeOpenAIModelForUpstream(account, billing)
+	return ResolveThinkingProtocol(upstream) == ThinkingProtocolPassbackRequired ||
+		ResolveThinkingProtocol(billing) == ThinkingProtocolPassbackRequired ||
+		ResolveThinkingProtocol(requested) == ThinkingProtocolPassbackRequired
 }
