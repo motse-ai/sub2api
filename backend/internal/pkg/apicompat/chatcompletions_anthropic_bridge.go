@@ -39,6 +39,13 @@ import (
 // API. It is semantically equivalent to composing AnthropicToResponses +
 // ResponsesToChatCompletionsRequest but avoids materializing the intermediate
 // ResponsesRequest and the extra marshal/unmarshal cycle.
+// AnthropicToChatCompletionsOptions customizes Anthropic→Chat Completions
+// conversion. The tool-use cache restores DeepSeek reasoning_content when
+// Claude Code echoes tool_use without the thinking block that produced it.
+type AnthropicToChatCompletionsOptions struct {
+	ReasoningContentByToolUseID func(toolUseID string) string
+}
+
 func AnthropicToChatCompletionsRequest(req *AnthropicRequest) (*ChatCompletionsRequest, error) {
 	return AnthropicToChatCompletionsRequestWithMinOutputTokens(req, DefaultMinMaxOutputTokens)
 }
@@ -46,6 +53,14 @@ func AnthropicToChatCompletionsRequest(req *AnthropicRequest) (*ChatCompletionsR
 // AnthropicToChatCompletionsRequestWithMinOutputTokens converts an Anthropic
 // Messages request using the supplied max_completion_tokens floor.
 func AnthropicToChatCompletionsRequestWithMinOutputTokens(req *AnthropicRequest, minOutputTokens int) (*ChatCompletionsRequest, error) {
+	return AnthropicToChatCompletionsRequestWithOptions(req, nil, minOutputTokens)
+}
+
+func AnthropicToChatCompletionsRequestWithOptions(req *AnthropicRequest, opts *AnthropicToChatCompletionsOptions) (*ChatCompletionsRequest, error) {
+	return AnthropicToChatCompletionsRequestWithOptionsAndMinOutputTokens(req, opts, DefaultMinMaxOutputTokens)
+}
+
+func AnthropicToChatCompletionsRequestWithOptionsAndMinOutputTokens(req *AnthropicRequest, opts *AnthropicToChatCompletionsOptions, minOutputTokens int) (*ChatCompletionsRequest, error) {
 	if req == nil {
 		return nil, fmt.Errorf("anthropic request is nil")
 	}
@@ -111,7 +126,30 @@ func AnthropicToChatCompletionsRequestWithMinOutputTokens(req *AnthropicRequest,
 	parallelToolCalls := true
 	out.ParallelToolCalls = &parallelToolCalls
 
+	applyAnthropicToolUseReasoningCache(out.Messages, opts)
 	return out, nil
+}
+
+func applyAnthropicToolUseReasoningCache(messages []ChatMessage, opts *AnthropicToChatCompletionsOptions) {
+	if opts == nil || opts.ReasoningContentByToolUseID == nil {
+		return
+	}
+	for i := range messages {
+		msg := &messages[i]
+		if msg.Role != "assistant" || msg.ReasoningContent != "" || len(msg.ToolCalls) == 0 {
+			continue
+		}
+		for _, tc := range msg.ToolCalls {
+			id := strings.TrimSpace(tc.ID)
+			if id == "" {
+				continue
+			}
+			if v := strings.TrimSpace(opts.ReasoningContentByToolUseID(id)); v != "" {
+				msg.ReasoningContent = v
+				break
+			}
+		}
+	}
 }
 
 // anthropicToChatMessages converts the Anthropic system field + message list
