@@ -481,3 +481,139 @@ func TestForwardAsAnthropic_ResponsesSupportedAccountStillUsesResponsesEndpoint(
 	require.Empty(t, upstream.lastReq.Header.Get("OpenAI-Beta"))
 	require.Equal(t, "ok", gjson.Get(rec.Body.String(), "content.0.text").String())
 }
+
+// Production: OpenAI-platform APIKey accounts that wrap DeepSeek (e.g. aiaaa.cc)
+// often have Extra.openai_responses_supported=true from a probe. Anthropic→
+// Responses drops unsigned thinking, so the next tool turn 400s with
+// "reasoning_content in the thinking mode must be passed back".
+func TestForwardAsAnthropic_DeepSeekUsesChatCompletionsWhenResponsesProbeSaysYes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{
+		"model":"deepseek-v4-flash",
+		"max_tokens":256,
+		"messages":[
+			{"role":"user","content":"what's the weather?"},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"user wants weather, call the tool"},
+				{"type":"text","text":"checking"},
+				{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"SF"}}
+			]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"sunny"}]}
+		],
+		"stream":false
+	}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"chatcmpl_ds","object":"chat.completion","model":"deepseek-v4.1-flash","choices":[{"index":0,"message":{"role":"assistant","content":"sunny in SF"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}`,
+		)),
+	}}
+	account := rawChatCompletionsTestAccount()
+	account.Name = "https://aiaaa.cc DeepSeek"
+	account.Extra = map[string]any{
+		openai_compat.ExtraKeyResponsesMode:      string(openai_compat.ResponsesSupportModeAuto),
+		openai_compat.ExtraKeyResponsesSupported: true,
+	}
+	account.Credentials["model_mapping"] = map[string]any{
+		"deepseek-v4-flash": "deepseek-v4.1-flash",
+	}
+
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+	result, err := svc.ForwardAsAnthropic(context.Background(), c, account, body, "", "")
+	require.NotNil(t, upstream.lastReq)
+	require.Equal(t, "http://upstream.example/v1/chat/completions", upstream.lastReq.URL.String(),
+		"DeepSeek /anthropic must skip Responses so unsigned thinking can become reasoning_content")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "deepseek-v4.1-flash", gjson.GetBytes(upstream.lastBody, "model").String())
+	require.Equal(t, "user wants weather, call the tool",
+		gjson.GetBytes(upstream.lastBody, "messages.1.reasoning_content").String())
+	require.Equal(t, "get_weather", gjson.GetBytes(upstream.lastBody, "messages.1.tool_calls.0.function.name").String())
+	require.False(t, gjson.GetBytes(upstream.lastBody, "input").Exists())
+	require.Equal(t, "sunny in SF", gjson.Get(rec.Body.String(), "content.0.text").String())
+}
+
+func TestForwardAsAnthropic_ClaudeAliasMappedToDeepSeekUsesChatCompletions(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"claude-haiku-4-5","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"chatcmpl_map","object":"chat.completion","model":"deepseek-v4.1-flash","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`,
+		)),
+	}}
+	account := rawChatCompletionsTestAccount()
+	account.Extra = map[string]any{
+		openai_compat.ExtraKeyResponsesMode:      string(openai_compat.ResponsesSupportModeAuto),
+		openai_compat.ExtraKeyResponsesSupported: true,
+	}
+	account.Credentials["model_mapping"] = map[string]any{
+		"claude-haiku-4-5": "deepseek-v4.1-flash",
+	}
+
+	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
+	result, err := svc.ForwardAsAnthropic(context.Background(), c, account, body, "", "")
+	require.NotNil(t, upstream.lastReq)
+	require.Equal(t, "http://upstream.example/v1/chat/completions", upstream.lastReq.URL.String())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "deepseek-v4.1-flash", gjson.GetBytes(upstream.lastBody, "model").String())
+}
+
+func TestShouldForwardAnthropicMessagesViaRawChatCompletionsForPassback(t *testing.T) {
+	responsesProbed := rawChatCompletionsTestAccount()
+	responsesProbed.Extra = map[string]any{
+		openai_compat.ExtraKeyResponsesMode:      string(openai_compat.ResponsesSupportModeAuto),
+		openai_compat.ExtraKeyResponsesSupported: true,
+	}
+
+	mapped := rawChatCompletionsTestAccount()
+	mapped.Extra = responsesProbed.Extra
+	mapped.Credentials["model_mapping"] = map[string]any{"claude-haiku-4-5": "deepseek-v4.1-flash"}
+
+	tests := []struct {
+		name    string
+		account *Account
+		body    string
+		want    bool
+	}{
+		{
+			name:    "deepseek request model",
+			account: responsesProbed,
+			body:    `{"model":"deepseek-v4-flash"}`,
+			want:    true,
+		},
+		{
+			name:    "claude alias mapped to deepseek",
+			account: mapped,
+			body:    `{"model":"claude-haiku-4-5"}`,
+			want:    true,
+		},
+		{
+			name:    "gpt stays on responses",
+			account: responsesProbed,
+			body:    `{"model":"gpt-5.4"}`,
+			want:    false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldForwardAnthropicMessagesViaRawChatCompletionsForPassback(tt.account, []byte(tt.body), "")
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
