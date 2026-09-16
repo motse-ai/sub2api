@@ -124,7 +124,9 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	}
 	compatReplayTrimmed := false
 	compatReplayGuardEnabled := shouldAutoInjectPromptCacheKeyForCompat(upstreamModel)
-	compatContinuationEnabled := openAICompatContinuationEnabled(account, upstreamModel)
+	skipCompatContinuationForAnthropicIngress := shouldDisableOpenAICompatContinuationForAnthropicIngress(c)
+	compatContinuationEnabled := openAICompatContinuationEnabled(account, upstreamModel) &&
+		!skipCompatContinuationForAnthropicIngress
 	previousResponseID := ""
 	if compatContinuationEnabled {
 		previousResponseID = s.getOpenAICompatSessionResponseID(ctx, c, account, promptCacheKey)
@@ -192,6 +194,9 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 			zap.Bool("compat_previous_response_id_attached", true),
 			zap.String("compat_previous_response_id", truncateOpenAIWSLogValue(previousResponseID, openAIWSIDValueMaxLen)),
 		)
+	}
+	if skipCompatContinuationForAnthropicIngress {
+		logFields = append(logFields, zap.Bool("compat_previous_response_id_skipped_anthropic_ingress", true))
 	}
 	if compatTurnState != "" {
 		logFields = append(logFields, zap.Bool("compat_turn_state_attached", true))

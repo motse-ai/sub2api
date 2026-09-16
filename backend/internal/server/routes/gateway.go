@@ -23,6 +23,7 @@ import (
 // This eliminates the need for an external Claude Code Router proxy.
 func handleAnthropicMessages(h *handler.Handlers) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		service.MarkAnthropicCompatIngress(c)
 		// Strip /anthropic prefix so the handler sees clean /v1/messages etc.
 		c.Request.URL.Path = c.Param("path")
 		if c.Request.URL.Path == "" {
