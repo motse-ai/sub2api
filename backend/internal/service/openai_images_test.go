@@ -1963,6 +1963,20 @@ func TestBuildOpenAIImagesResponsesRequest_PassesThroughNForMultiImageModels(t *
 	require.Equal(t, "draw a cat", gjson.GetBytes(body, "input.0.content.0.text").String())
 }
 
+func TestOpenAIImagesResponsesMainModel_UsesGPT55Carrier(t *testing.T) {
+	require.Equal(t, "gpt-5.5", openAIImagesResponsesMainModel)
+
+	parsed := &OpenAIImagesRequest{
+		Endpoint: openAIImagesGenerationsEndpoint,
+		Model:    "gpt-image-2",
+		Prompt:   "draw a cat",
+	}
+	body, err := buildOpenAIImagesResponsesRequest(parsed, "gpt-image-2")
+	require.NoError(t, err)
+	require.Equal(t, "gpt-5.5", gjson.GetBytes(body, "model").String())
+	require.Equal(t, "gpt-image-2", gjson.GetBytes(body, "tools.0.model").String())
+}
+
 func TestBuildOpenAIImagesResponsesRequest_ForcesImageToolChoice(t *testing.T) {
 	parsed := &OpenAIImagesRequest{
 		Endpoint: openAIImagesGenerationsEndpoint,
