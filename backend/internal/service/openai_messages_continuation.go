@@ -27,6 +27,34 @@ func openAICompatContinuationEnabled(account *Account, model string) bool {
 	return shouldAutoInjectPromptCacheKeyForCompat(model)
 }
 
+const anthropicCompatIngressKey = "openai_compat_anthropic_ingress"
+
+// MarkAnthropicCompatIngress records that this request entered through the
+// /anthropic router (Claude Code Messages compatibility), not /v1/messages.
+func MarkAnthropicCompatIngress(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.Set(anthropicCompatIngressKey, true)
+}
+
+// shouldDisableOpenAICompatContinuationForAnthropicIngress disables our
+// previous_response_id shortcut only for /anthropic routed traffic.
+// That entry already replays the full Anthropic transcript; attaching a
+// stored resp_ id and trimming to the latest turn hangs on relays that do
+// not persist Responses continuation (e.g. Aihubmix).
+func shouldDisableOpenAICompatContinuationForAnthropicIngress(c *gin.Context) bool {
+	if c == nil {
+		return false
+	}
+	if v, ok := c.Get(anthropicCompatIngressKey); ok {
+		enabled, _ := v.(bool)
+		return enabled
+	}
+	path := strings.TrimSpace(c.FullPath())
+	return path == "/anthropic" || strings.HasPrefix(path, "/anthropic/")
+}
+
 func trimAnthropicCompatResponsesInputToLatestTurn(req *apicompat.ResponsesRequest) {
 	if req == nil || len(req.Input) == 0 {
 		return

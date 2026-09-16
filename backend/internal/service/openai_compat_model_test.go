@@ -758,6 +758,56 @@ func TestForwardAsAnthropic_AttachesPreviousResponseIDForCompatContinuation(t *t
 	require.Equal(t, "second", gjson.GetBytes(upstream.lastBody, "input.1.content.0.text").String())
 }
 
+func TestForwardAsAnthropic_SkipsPreviousResponseIDForAnthropicIngress(t *testing.T) {
+	t.Parallel()
+	gin.SetMode(gin.TestMode)
+
+	account := &Account{
+		ID:          1,
+		Name:        "openai-apikey",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://api.openai.com/v1",
+		},
+	}
+	firstBody := []byte(`{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"first"}],"stream":false}`)
+	secondBody := []byte(`{"model":"claude-sonnet-4-5","max_tokens":16,"messages":[{"role":"user","content":"first"},{"role":"assistant","content":"ok"},{"role":"user","content":"second"}],"stream":false}`)
+
+	upstream := &httpUpstreamRecorder{}
+	svc := &OpenAIGatewayService{
+		httpUpstream: upstream,
+		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
+	}
+
+	upstream.resp = openAICompatSSECompletedResponse("resp_first", "gpt-5.5")
+	firstRec := httptest.NewRecorder()
+	firstCtx, _ := gin.CreateTestContext(firstRec)
+	firstCtx.Request = httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(firstBody))
+	firstCtx.Request.Header.Set("Content-Type", "application/json")
+	MarkAnthropicCompatIngress(firstCtx)
+
+	firstResult, err := svc.ForwardAsAnthropic(context.Background(), firstCtx, account, firstBody, "stable-cache-key", "gpt-5.5")
+	require.NoError(t, err)
+	require.NotNil(t, firstResult)
+
+	upstream.resp = openAICompatSSECompletedResponse("resp_second", "gpt-5.5")
+	secondRec := httptest.NewRecorder()
+	secondCtx, _ := gin.CreateTestContext(secondRec)
+	secondCtx.Request = httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", bytes.NewReader(secondBody))
+	secondCtx.Request.Header.Set("Content-Type", "application/json")
+	MarkAnthropicCompatIngress(secondCtx)
+	svc.bindOpenAICompatSessionResponseID(context.Background(), secondCtx, account, "stable-cache-key", "resp_should_not_attach")
+
+	secondResult, err := svc.ForwardAsAnthropic(context.Background(), secondCtx, account, secondBody, "stable-cache-key", "gpt-5.5")
+	require.NoError(t, err)
+	require.NotNil(t, secondResult)
+	require.False(t, gjson.GetBytes(upstream.lastBody, "previous_response_id").Exists())
+	require.GreaterOrEqual(t, gjson.GetBytes(upstream.lastBody, "input.#").Int(), int64(3))
+}
+
 func TestForwardAsAnthropic_PreviousResponseIDKeepsMultiToolCallContext(t *testing.T) {
 	t.Parallel()
 	gin.SetMode(gin.TestMode)
