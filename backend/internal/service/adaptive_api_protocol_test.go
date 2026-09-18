@@ -260,7 +260,13 @@ func TestFixedCNResponsesProtocolOverridesStaleChatMode(t *testing.T) {
 			err := tc.forward(svc, adaptiveProtocolTestContext(tc.path, tc.body), account, tc.body)
 
 			require.Error(t, err)
-			require.Equal(t, "http://responses.example/responses", upstream.lastReq.URL.String())
+			wantURL := "http://responses.example/responses"
+			if tc.name == "messages" {
+				// DeepSeek /v1/messages must stay on Chat Completions so unsigned
+				// thinking can be passed back as reasoning_content.
+				wantURL = "http://responses.example/v1/chat/completions"
+			}
+			require.Equal(t, wantURL, upstream.lastReq.URL.String())
 		})
 	}
 }

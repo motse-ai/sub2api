@@ -260,9 +260,9 @@ func (s *OpenAIGatewayService) streamChatCompletionsAsAnthropic(
 		if chunk != nil {
 			for _, choice := range chunk.Choices {
 				if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
-					streamReasoning.WriteString(*choice.Delta.ReasoningContent)
+					_, _ = streamReasoning.WriteString(*choice.Delta.ReasoningContent)
 				} else if choice.Delta.Reasoning != nil && *choice.Delta.Reasoning != "" {
-					streamReasoning.WriteString(*choice.Delta.Reasoning)
+					_, _ = streamReasoning.WriteString(*choice.Delta.Reasoning)
 				}
 				streamToolIDs = append(streamToolIDs, collectChatToolCallIDs(choice.Delta.ToolCalls)...)
 			}
