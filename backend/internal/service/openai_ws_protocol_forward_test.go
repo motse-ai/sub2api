@@ -165,7 +165,7 @@ func TestOpenAIGatewayService_Forward_HTTPIngressStaysHTTPWhenWSEnabled(t *testi
 		Concurrency: 1,
 		Credentials: map[string]any{
 			"api_key":  "sk-test",
-			"base_url": wsFallbackServer.URL,
+			"base_url": "https://api.openai.com/v1",
 		},
 		Extra: map[string]any{
 			"responses_websockets_v2_enabled": true,
@@ -240,7 +240,7 @@ func TestOpenAIGatewayService_Forward_HTTPIngressRetriesInvalidEncryptedContentO
 		Concurrency: 1,
 		Credentials: map[string]any{
 			"api_key":  "sk-test",
-			"base_url": wsFallbackServer.URL,
+			"base_url": "https://api.openai.com/v1",
 		},
 		Extra: map[string]any{
 			"responses_websockets_v2_enabled": true,
@@ -329,7 +329,7 @@ func TestOpenAIGatewayService_Forward_HTTPIngressRetriesWrappedInvalidEncryptedC
 		Concurrency: 1,
 		Credentials: map[string]any{
 			"api_key":  "sk-test",
-			"base_url": wsFallbackServer.URL,
+			"base_url": "https://api.openai.com/v1",
 		},
 		Extra: map[string]any{
 			"responses_websockets_v2_enabled": true,
@@ -398,7 +398,7 @@ func TestOpenAIGatewayService_Forward_APIKeyHTTPPreservesPreviousResponseIDWhenW
 		Concurrency: 1,
 		Credentials: map[string]any{
 			"api_key":  "sk-test",
-			"base_url": wsFallbackServer.URL,
+			"base_url": "https://api.openai.com/v1",
 		},
 		Extra: map[string]any{
 			"responses_websockets_v2_enabled": true,
@@ -410,6 +410,62 @@ func TestOpenAIGatewayService_Forward_APIKeyHTTPPreservesPreviousResponseIDWhenW
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Equal(t, "resp_123", gjson.GetBytes(upstream.lastBody, "previous_response_id").String())
+}
+
+func TestOpenAIGatewayService_Forward_CompatAPIKeyHTTPStripsPreviousResponseID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+	c.Request.Header.Set("User-Agent", "custom-client/1.0")
+	SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
+
+	upstream := &httpUpstreamRecorder{
+		resp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"usage":{"input_tokens":1,"output_tokens":2,"input_tokens_details":{"cached_tokens":0}}}`,
+			)),
+		},
+	}
+
+	cfg := &config.Config{}
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.Enabled = false
+
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		httpUpstream:     upstream,
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+	}
+
+	account := &Account{
+		ID:          236,
+		Name:        "aiio-GPT兜底-minimax",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "sk-aiio",
+			"base_url": "https://m.aiio.chat/v1",
+			"model_mapping": map[string]any{
+				"gpt-5.6-sol": "MiniMax-M3",
+			},
+		},
+		Extra: map[string]any{
+			"openai_responses_supported": true,
+		},
+	}
+
+	body := []byte(`{"model":"gpt-5.6-sol","stream":false,"previous_response_id":"resp_openai","input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, gjson.GetBytes(upstream.lastBody, "previous_response_id").Exists(), "compat MiniMax rewrite must not inherit OpenAI previous_response_id")
+	require.Equal(t, "MiniMax-M3", gjson.GetBytes(upstream.lastBody, "model").String())
 }
 
 func TestOpenAIGatewayService_Forward_WSv2Dial426FallbackHTTP(t *testing.T) {
