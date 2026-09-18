@@ -82,6 +82,52 @@ func isOpenAIOAuthServableModel(requestedModel string) bool {
 	return true
 }
 
+// shouldKeepOpenAIResponsesPreviousResponseID reports whether HTTP/SSE
+// Responses forwarding may send previous_response_id to this account.
+//
+// Keep it only for official OpenAI store accounts (OAuth Codex, or API keys
+// whose base URL is api.openai.com) when the locally mapped upstream model is
+// not a foreign family. Compat gateways such as AIIO are never official store,
+// so they drop previous_response_id even if the client requested a GPT alias
+// (AIIO may rewrite gpt-* to MiniMax after the request leaves sub2api).
+func shouldKeepOpenAIResponsesPreviousResponseID(account *Account, upstreamModel string) bool {
+	return isOfficialOpenAIResponsesStoreAccount(account) && isOpenAIPreviousResponseStoreModel(upstreamModel)
+}
+
+func isOfficialOpenAIResponsesStoreAccount(account *Account) bool {
+	if account == nil || account.Platform != PlatformOpenAI {
+		return false
+	}
+	if account.IsOpenAIOAuthLike() {
+		return true
+	}
+	if !account.IsOpenAIApiKey() {
+		return false
+	}
+	return isOfficialOpenAIModelsBaseURL(account.GetOpenAIBaseURL())
+}
+
+func isOpenAIPreviousResponseStoreModel(model string) bool {
+	// Use the mapped upstream slug. MiniMax/Grok/DeepSeek and other foreign
+	// families never persist an OpenAI previous_response_id. GPT/o-series/Codex
+	// aliases (including names without the substring "gpt", e.g. o3 or
+	// codex-auto-review) stay eligible when the account itself is official store.
+	return isOpenAIOAuthServableModel(model)
+}
+
+// accountSupportsOpenAIPreviousResponseContinuation reports whether an account
+// may serve a Responses continuation that still carries previous_response_id.
+// Self-contained input (previousResponseCanMove) may move to compat accounts
+// because forwarding will strip the store field. Tool-output-only continuations
+// cannot: the OpenAI response id is meaningless on MiniMax/AIIO.
+func accountSupportsOpenAIPreviousResponseContinuation(account *Account, requestedModel string, requireCompact bool, previousResponseID string, previousResponseCanMove bool) bool {
+	if strings.TrimSpace(previousResponseID) == "" || previousResponseCanMove {
+		return true
+	}
+	upstreamModel := resolveOpenAIAccountUpstreamModelForRequest(account, requestedModel, requireCompact)
+	return shouldKeepOpenAIResponsesPreviousResponseID(account, upstreamModel)
+}
+
 // resolveOpenAICompactForwardModel determines the compact-only upstream model
 // for /responses/compact requests. It never affects normal /responses traffic.
 // When no compact-specific mapping matches, the input model is returned as-is.

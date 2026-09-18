@@ -1800,6 +1800,9 @@ func (s *defaultOpenAIAccountScheduler) isAccountRequestCompatibleReason(ctx con
 	if req.RequestedModel != "" && !account.IsModelSupported(req.RequestedModel) {
 		return false, "model_not_supported"
 	}
+	if !accountSupportsOpenAIPreviousResponseContinuation(account, req.RequestedModel, req.RequireCompact, req.PreviousResponseID, req.PreviousResponseCanMove) {
+		return false, "previous_response_store_unsupported"
+	}
 	if req.GroupID != nil && s != nil && s.service != nil &&
 		s.service.needsUpstreamChannelRestrictionCheck(ctx, req.GroupID) &&
 		s.service.isUpstreamModelRestrictedByChannel(ctx, *req.GroupID, account, req.RequestedModel, req.RequireCompact) {
@@ -2290,7 +2293,8 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 				if selection == nil || selection.Account == nil {
 					return selection, decision, nil
 				}
-				if accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) {
+				if accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) &&
+					accountSupportsOpenAIPreviousResponseContinuation(selection.Account, requestedModel, requireCompact, previousResponseID, previousResponseCanMove) {
 					return selection, decision, nil
 				}
 				if selection.ReleaseFunc != nil {
@@ -2316,7 +2320,8 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 				return selection, decision, nil
 			}
 			if s.isOpenAIAccountTransportCompatible(selection.Account, requiredTransport) &&
-				accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) {
+				accountSupportsOpenAICapabilities(selection.Account, requiredCapability, requiredImageCapability) &&
+				accountSupportsOpenAIPreviousResponseContinuation(selection.Account, requestedModel, requireCompact, previousResponseID, previousResponseCanMove) {
 				return selection, decision, nil
 			}
 			if selection.ReleaseFunc != nil {
