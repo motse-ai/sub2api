@@ -197,8 +197,9 @@ func TestOpenAIGatewayService_OAuthDropsOrphanAfterDroppingPreviousResponse(t *t
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	require.Len(t, upstream.bodies, 1)
-	require.False(t, gjson.GetBytes(upstream.bodies[0], "previous_response_id").Exists())
-	require.Empty(t, gjson.GetBytes(upstream.bodies[0], "input").Array())
+	require.Equal(t, "resp_missing", gjson.GetBytes(upstream.bodies[0], "previous_response_id").String(),
+		"OAuth Codex HTTP is an official store and must keep previous_response_id")
+	require.Equal(t, 1, len(gjson.GetBytes(upstream.bodies[0], "input").Array()))
 }
 
 func TestOpenAIGatewayService_PreservesOversizedToolOutputForUpstream(t *testing.T) {

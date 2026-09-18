@@ -637,7 +637,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		markPatchSet("max_output_tokens", clampedCap)
 	}
 	if wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 &&
-		!account.IsOpenAIApiKey() && gjson.GetBytes(body, "previous_response_id").Exists() {
+		strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) != "" &&
+		!shouldKeepOpenAIResponsesPreviousResponseID(account, upstreamModel) {
 		markPatchDelete("previous_response_id")
 	}
 	if openAIRequestBodyMayContainEmptyBase64InputImage(body) {
