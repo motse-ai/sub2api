@@ -28,7 +28,7 @@ services:
     # weishaw/sub2api:* — upstream releases lack this route and Claude Code will
     # get HTML (HTTP 200 malformed). Also keep rootfs read-only so the admin
     # GitHub "online update" cannot overwrite /app/sub2api in-place.
-    image: sub2api:0.2.5-anthropic
+    image: sub2api:0.2.9-anthropic
     container_name: sub2api
     restart: unless-stopped
     read_only: true
