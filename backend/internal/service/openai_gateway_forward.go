@@ -736,6 +736,13 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 	// Run after orphan-output filtering and all request-map rebuilds so a
 	// compaction trigger cannot remain ahead of surviving history items.
+	if strippedBody, stripped, stripErr := StripOpenAIResponsesWebSearchCallItems(body); stripErr != nil {
+		return nil, fmt.Errorf("strip web_search_call items: %w", stripErr)
+	} else if stripped {
+		body = strippedBody
+		requestView = newOpenAIRequestView(body)
+		reqBody = nil
+	}
 	if normalizedBody, changed, normalizeErr := NormalizeCompactionTriggerInputOrder(body); normalizeErr != nil {
 		return nil, fmt.Errorf("normalize compaction trigger order: %w", normalizeErr)
 	} else if changed {

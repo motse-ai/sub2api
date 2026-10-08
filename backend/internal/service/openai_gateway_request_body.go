@@ -1554,6 +1554,12 @@ func normalizeOpenAIResponsesWebSocketCompatibilityBody(body []byte, account *Ac
 	}
 	// Keep this last: earlier compatibility passes may filter or rebuild input.
 	// Remote compaction v2 requires one trigger as the final input item.
+	if strippedBody, stripped, stripErr := StripOpenAIResponsesWebSearchCallItems(normalized); stripErr != nil {
+		return body, false, fmt.Errorf("strip websocket web_search_call items: %w", stripErr)
+	} else if stripped {
+		normalized = strippedBody
+		changed = true
+	}
 	if triggerBody, triggerChanged, err := NormalizeCompactionTriggerInputOrder(normalized); err != nil {
 		return body, false, fmt.Errorf("normalize websocket compaction trigger order: %w", err)
 	} else if triggerChanged {
@@ -1626,6 +1632,13 @@ func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, boo
 			normalized = next
 			changed = true
 		}
+	}
+
+	if strippedBody, stripped, stripErr := StripOpenAIResponsesWebSearchCallItems(normalized); stripErr != nil {
+		return body, false, stripErr
+	} else if stripped {
+		normalized = strippedBody
+		changed = true
 	}
 
 	if compact {

@@ -85,6 +85,45 @@ func TestNormalizeCompactionTriggerInputOrder_AlreadyFinalPreservesBytes(t *test
 	require.Equal(t, string(body), string(normalized))
 }
 
+func TestStripOpenAIResponsesWebSearchCallItems_DropsSearchHistory(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"store":false,"input":[` +
+		`{"type":"message","role":"user","content":"refactor"},` +
+		`{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"parser","queries":null}},` +
+		`{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"ls\"}"},` +
+		`{"type":"function_call_output","call_id":"call_1","output":"main.go","sequence":9007199254740993},` +
+		`{"type":"compaction_trigger"}]}`)
+
+	normalized, changed, err := StripOpenAIResponsesWebSearchCallItems(body)
+	require.NoError(t, err)
+	require.True(t, changed)
+	items := gjson.GetBytes(normalized, "input").Array()
+	require.Len(t, items, 4)
+	require.Equal(t, "message", items[0].Get("type").String())
+	require.Equal(t, "function_call", items[1].Get("type").String())
+	require.Equal(t, "function_call_output", items[2].Get("type").String())
+	require.Equal(t, "9007199254740993", items[2].Get("sequence").Raw)
+	require.Equal(t, "compaction_trigger", items[3].Get("type").String())
+	require.False(t, gjson.GetBytes(normalized, `input.#(type=="web_search_call")`).Exists())
+}
+
+func TestNormalizeOpenAIPassthroughOAuthBodyDropsWebSearchCall(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"store":false,"instructions":"You are a helpful coding assistant.","input":[{"type":"message","role":"user","content":"继续"},{"type":"web_search_call","id":"ws_1","action":{"type":"search","queries":null}}]}`)
+	normalized, changed, err := normalizeOpenAIPassthroughOAuthBody(body, false)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.False(t, gjson.GetBytes(normalized, `input.#(type=="web_search_call")`).Exists())
+	require.Equal(t, "message", gjson.GetBytes(normalized, "input.0.type").String())
+	require.Equal(t, "继续", gjson.GetBytes(normalized, "input.0.content").String())
+}
+
+func TestStripOpenAIResponsesWebSearchCallItems_PreservesBodyWithoutSearch(t *testing.T) {
+	body := []byte(`{"input":[{"type":"message","role":"user","content":"继续"},{"type":"compaction_trigger"}]}`)
+	normalized, changed, err := StripOpenAIResponsesWebSearchCallItems(body)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, string(body), string(normalized))
+}
+
 func TestNormalizeCompactionTriggerInputOrder_PreservesHistoryAndLargeNumbers(t *testing.T) {
 	body := []byte(`{"input":[{"type":"compaction_trigger"},{"type":"message","id":"msg_1","content":"visible"},{"type":"function_call_output","call_id":"call_1","output":"result","sequence":9007199254740993}]}`)
 

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"net/http"
 	"strings"
 
@@ -56,6 +57,43 @@ func NormalizeCompactionTriggerInputOrder(body []byte) ([]byte, bool, error) {
 	}
 	normalized = append(normalized, map[string]any{"type": "compaction_trigger"})
 	payload["input"] = normalized
+	encoded, err := marshalOpenAIUpstreamJSON(payload)
+	if err != nil {
+		return body, false, err
+	}
+	return encoded, true, nil
+}
+
+// StripOpenAIResponsesWebSearchCallItems removes replayed web_search_call items
+// from a Responses input. ChatGPT answers compaction and continuation history
+// that still contains those items with 502 "response protection is unavailable"
+// on every account; the same history without them completes.
+func StripOpenAIResponsesWebSearchCallItems(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 || !bytes.Contains(body, []byte(`"web_search_call"`)) {
+		return body, false, nil
+	}
+	var payload map[string]any
+	if err := decodeOpenAIJSONUseNumber(body, &payload); err != nil {
+		return body, false, err
+	}
+	input, ok := payload["input"].([]any)
+	if !ok || len(input) == 0 {
+		return body, false, nil
+	}
+	stripped := make([]any, 0, len(input))
+	removed := 0
+	for _, raw := range input {
+		item, itemOK := raw.(map[string]any)
+		if itemOK && item["type"] == "web_search_call" {
+			removed++
+			continue
+		}
+		stripped = append(stripped, raw)
+	}
+	if removed == 0 {
+		return body, false, nil
+	}
+	payload["input"] = stripped
 	encoded, err := marshalOpenAIUpstreamJSON(payload)
 	if err != nil {
 		return body, false, err
