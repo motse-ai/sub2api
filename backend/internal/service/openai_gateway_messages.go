@@ -417,6 +417,13 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	// account/cache identity. Match forwardGrokResponses: one strip+retry before
 	// treating the 400 as a hard failure / failover trigger.
 	var resp *http.Response
+	defer func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	encryptedReasoningStreamRetried := false
+sendOpenAIMessagesUpstream:
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
 			if account.Platform != PlatformGrok {
@@ -464,7 +471,6 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 			zap.String("upstream_error_preview", truncateOpenAIWSLogValue(string(respBody), 240)),
 		)
 	}
-	defer func() { _ = resp.Body.Close() }()
 
 	// 8. Handle error response with failover
 	if resp.StatusCode >= 400 {
@@ -528,6 +534,53 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		// Client wants JSON: buffer the streaming response and assemble a JSON reply.
 		result, handleErr = s.handleAnthropicBufferedStreamingResponse(resp, c, account, originalModel, billingModel, upstreamModel, startTime)
 	}
+	if account.Platform == PlatformOpenAI && !encryptedReasoningStreamRetried && !openAIMessagesWriterStarted(c) {
+		var encryptedErr *openAIEncryptedReasoningStreamError
+		if errors.As(handleErr, &encryptedErr) {
+			var decoded map[string]any
+			if decErr := decodeOpenAIJSONUseNumber(responsesBody, &decoded); decErr == nil && trimOpenAIEncryptedReasoningItems(decoded) {
+				nextBody, mErr := marshalOpenAIUpstreamJSON(decoded)
+				if mErr != nil {
+					return nil, fmt.Errorf("serialize encrypted reasoning retry body: %w", mErr)
+				}
+				responsesBody = nextBody
+				encryptedReasoningStreamRetried = true
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+					resp.Body = nil
+				}
+				upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+				upstreamReq, err = s.buildUpstreamRequest(upstreamCtx, c, account, responsesBody, token, isStream, promptCacheKey, false)
+				releaseUpstreamCtx()
+				if err != nil {
+					return nil, fmt.Errorf("build encrypted reasoning retry request: %w", err)
+				}
+				if account.Platform != PlatformGrok && promptCacheKey != "" {
+					isolatedSessionID := generateSessionUUID(isolateOpenAIUpstreamSessionID(apiKeyID, codexAccountIdentitySource(c, account), promptCacheKey))
+					upstreamReq.Header.Set("session_id", isolatedSessionID)
+					if upstreamReq.Header.Get("conversation_id") != "" {
+						upstreamReq.Header.Set("conversation_id", isolatedSessionID)
+					}
+				}
+				if account.UsesOpenAICodexProtocol() && account.Platform != PlatformGrok {
+					ensureCodexIdentityHeaders(upstreamReq.Header)
+					enforceCodexIdentityHeaders(upstreamReq.Header)
+				}
+				if account.UsesOpenAICodexProtocol() && promptCacheKey != "" && strings.TrimSpace(c.GetHeader("conversation_id")) == "" {
+					upstreamReq.Header.Del("conversation_id")
+				}
+				if compatTurnState != "" && upstreamReq.Header.Get("x-codex-turn-state") == "" {
+					upstreamReq.Header.Set("x-codex-turn-state", compatTurnState)
+				}
+				logger.L().Info("openai messages: retrying once after stripping unverifiable encrypted reasoning",
+					zap.Int64("account_id", account.ID),
+				)
+				goto sendOpenAIMessagesUpstream
+			}
+			writeAnthropicError(c, http.StatusBadGateway, "api_error", encryptedErr.message)
+			return nil, fmt.Errorf("upstream response failed: %s", encryptedErr.message)
+		}
+	}
 
 	// cyber_policy：标记已设、error 已按 Anthropic 格式发给客户端。丢弃 result、返回哨兵，
 	// 使 handler 落入 tokens=0 免费用量行（对齐 /v1/responses），不计费、不 failover。
@@ -569,6 +622,21 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 
 	stampOpenAIResponsesUpstreamEndpoint(c, result)
 	return result, handleErr
+}
+
+// openAIEncryptedReasoningStreamError asks ForwardAsAnthropic to drop rejected
+// reasoning ciphertext and replay the same account once. It is returned only
+// when the client has not been written yet.
+type openAIEncryptedReasoningStreamError struct {
+	message string
+}
+
+func (e *openAIEncryptedReasoningStreamError) Error() string {
+	return "openai encrypted reasoning stream retry: " + e.message
+}
+
+func openAIMessagesWriterStarted(c *gin.Context) bool {
+	return c != nil && c.Writer != nil && c.Writer.Written()
 }
 
 func ensureCodexOAuthInstructionsField(reqBody map[string]any) {
@@ -651,6 +719,9 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 			return nil, fmt.Errorf("openai cyber_policy: %s", msg)
 		}
 		message := openAICompatFailedResponseMessage(finalResponse)
+		if isOpenAIEncryptedReasoningVerifyFailure(message) {
+			return nil, &openAIEncryptedReasoningStreamError{message: message}
+		}
 		if openAIStreamFailedEventShouldFailover(payload, message) {
 			return nil, s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, payload, message, upstreamModel, resp.Header)
 		}
@@ -1081,6 +1152,10 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 					return true
 				}
 				message := extractOpenAISSEErrorMessage(payloadBytes)
+				if !clientOutputStarted && !clientDisconnected && isOpenAIEncryptedReasoningVerifyFailure(message) {
+					streamNonFailoverErr = &openAIEncryptedReasoningStreamError{message: message}
+					return true
+				}
 				// Once Anthropic output has started, switching accounts would splice
 				// two model streams together. Surface a proper Anthropic error event
 				// instead of returning a failover error that the handler cannot retry.

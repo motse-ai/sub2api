@@ -345,6 +345,16 @@ func asDeepSeekResponsesSlice(value any) ([]any, bool) {
 	}
 }
 
+// isOpenAIEncryptedReasoningVerifyFailure reports the ChatGPT rejection of a
+// replayed reasoning ciphertext. HTTP 400 uses the same phrase; HTTP 200 SSE
+// carries it with no error code, so the message is the match.
+func isOpenAIEncryptedReasoningVerifyFailure(message string) bool {
+	msg := strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(msg, "the encrypted content") &&
+		strings.Contains(msg, "could not be verified") &&
+		strings.Contains(msg, "could not be decrypted or parsed")
+}
+
 func trimOpenAIEncryptedReasoningItems(reqBody map[string]any) bool {
 	if len(reqBody) == 0 {
 		return false
