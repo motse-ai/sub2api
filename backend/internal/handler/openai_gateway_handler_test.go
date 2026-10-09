@@ -17,6 +17,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -27,6 +28,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestOpenAIHandleStreamingAwareError_JSONEscaping(t *testing.T) {
@@ -1017,9 +1021,59 @@ func TestOpenAIResponses_FunctionCallOutputHTTPGuidanceDoesNotSuggestPreviousRes
 	h := newOpenAIHandlerForPreviousResponseIDValidation(t, nil)
 	h.Responses(c)
 
-	require.Equal(t, http.StatusBadRequest, w.Code)
-	require.Contains(t, w.Body.String(), "Responses WebSocket v2")
+	require.NotContains(t, w.Body.String(), "function_call_output requires call_id")
 	require.NotContains(t, w.Body.String(), "reuse previous_response_id")
+}
+
+func TestOpenAIResponses_MissingCallIDLogsShapeWithoutOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	core, logs := observer.New(zap.InfoLevel)
+	body := `{
+		"model":"gpt-6.1-sol",
+		"stream":true,
+		"input":[
+			{"type":"message","role":"user","content":"SECRET_PROMPT"},
+			{"type":"function_call","name":"shell"},
+			{"type":"function_call_output","name":"shell","namespace":"codex","output":"SECRET_OUTPUT"},
+			{"type":"function_call_output","namespace":"mcp","output":[{"type":"input_text","text":"SECRET_PART"}]}
+		]
+	}`
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(body))
+	c.Request = c.Request.WithContext(logger.IntoContext(c.Request.Context(), zap.New(core)))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	groupID := int64(2)
+	c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{
+		ID:      101,
+		GroupID: &groupID,
+		User:    &service.User{ID: 1},
+	})
+	c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{
+		UserID:      1,
+		Concurrency: 1,
+	})
+
+	h := newOpenAIHandlerForPreviousResponseIDValidation(t, nil)
+	h.Responses(c)
+
+	require.NotContains(t, w.Body.String(), "function_call_output requires call_id")
+	require.NotContains(t, w.Body.String(), "SECRET_OUTPUT")
+	require.NotContains(t, w.Body.String(), "SECRET_PROMPT")
+	require.NotContains(t, w.Body.String(), "SECRET_PART")
+
+	entries := logs.FilterMessage("openai.orphan_function_call_output_normalized").All()
+	require.Len(t, entries, 1)
+	for _, field := range entries[0].Context {
+		if field.Type != zapcore.StringType {
+			continue
+		}
+		require.NotContains(t, field.String, "SECRET_OUTPUT")
+		require.NotContains(t, field.String, "SECRET_PROMPT")
+		require.NotContains(t, field.String, "SECRET_PART")
+	}
 }
 
 func TestOpenAIResponsesWebSocket_SetsClientTransportWSWhenUpgradeValid(t *testing.T) {
