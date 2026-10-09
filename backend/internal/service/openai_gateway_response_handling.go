@@ -606,6 +606,10 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 						}
 					}
 				}
+				if !outputStarted && !cyberHit && isOpenAIEncryptedReasoningVerifyFailure(failedMessage) {
+					streamEarlyErr = &openAIEncryptedReasoningStreamError{message: failedMessage}
+					return
+				}
 				forceFlushFailedEvent = true
 				sawFailedEvent = true
 				terminalFailurePending = !codexFailureTerminal || eventType == "response.failed"

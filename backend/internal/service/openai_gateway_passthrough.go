@@ -356,6 +356,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 
 	agentTaskRecoveryTried := false
 	compactModelFallbackRetried := false
+	encryptedReasoningStreamRetried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
 	var resp *http.Response
 	var usage *OpenAIUsage
@@ -450,6 +451,15 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		if reqStream {
 			result, handleErr := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
 			if handleErr != nil {
+				if nextBody, retry, terminalErr := consumeOpenAIEncryptedReasoningStreamRetry(body, handleErr, &encryptedReasoningStreamRetried, c); terminalErr != nil {
+					_ = resp.Body.Close()
+					return nil, terminalErr
+				} else if retry {
+					body = nextBody
+					_ = resp.Body.Close()
+					logger.LegacyPrintf("service.openai_gateway", "openai responses: retrying once after stripping unverifiable encrypted reasoning (account: %s)", account.Name)
+					continue
+				}
 				if retryBody, fallbackModel, retry := s.applyOpenAIPassthroughCompactFallbackFromSignal(
 					c, account, requestedModel, body, handleErr, compactModelFallbackRetried, resp,
 				); retry {
@@ -2138,6 +2148,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 							return resultWithUsage(), fmt.Errorf("upstream response failed: passthrough rule matched message=%s", errMsg)
 						}
 					}
+				}
+				if !outputStarted && !cyberHit && isOpenAIEncryptedReasoningVerifyFailure(failedMessage) {
+					return resultWithUsage(), &openAIEncryptedReasoningStreamError{message: failedMessage}
 				}
 				forceFlushFailedEvent = true
 				sawFailedEvent = true
