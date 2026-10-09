@@ -491,6 +491,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			zap.String("normalization", "call_output_to_user_message"),
 		)
 	}
+	if normalizedBody, changed := normalizeOrphanFunctionCallOutputs(body); changed {
+		body = normalizedBody
+		reqLog.Info("openai.orphan_function_call_output_normalized",
+			zap.String("normalization", "call_output_to_developer_message"),
+		)
+	}
 
 	reqStream, ok := parseOpenAICompatibleStream(body)
 	if !ok {
@@ -1663,9 +1669,10 @@ func (h *OpenAIGatewayHandler) validateFunctionCallOutputRequest(c *gin.Context,
 	}
 
 	if validation.HasFunctionCallOutputMissingCallID {
-		reqLog.Warn("openai.request_validation_failed",
-			zap.String("reason", "function_call_output_missing_call_id"),
-		)
+		reqLog.Warn("openai.request_validation_failed", append(
+			[]zap.Field{zap.String("reason", "function_call_output_missing_call_id")},
+			functionCallOutputMissingCallIDFields(body)...,
+		)...)
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "function_call_output requires call_id on HTTP requests; continuation via previous_response_id is only supported on Responses WebSocket v2")
 		return false
 	}
@@ -1678,6 +1685,201 @@ func (h *OpenAIGatewayHandler) validateFunctionCallOutputRequest(c *gin.Context,
 	)
 	h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "function_call_output requires item_reference ids matching each call_id on HTTP requests; continuation via previous_response_id is only supported on Responses WebSocket v2")
 	return false
+}
+
+// functionCallOutputMissingCallIDFields records which tool result failed HTTP
+// continuation without copying output text into the log.
+func functionCallOutputMissingCallIDFields(body []byte) []zap.Field {
+	var (
+		missing             int
+		firstName           string
+		firstNamespace      string
+		firstOutputIsString bool
+		firstCaptured       bool
+		hasToolCall         bool
+	)
+	gjson.GetBytes(body, "input").ForEach(func(_, item gjson.Result) bool {
+		if !item.IsObject() {
+			return true
+		}
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if isLoggedToolCallItemType(itemType) {
+			hasToolCall = true
+		}
+		if itemType != "function_call_output" {
+			return true
+		}
+		callID := item.Get("call_id")
+		if callID.Exists() && strings.TrimSpace(callID.String()) != "" {
+			return true
+		}
+		missing++
+		if firstCaptured {
+			return true
+		}
+		firstCaptured = true
+		firstName = truncateLogToken(item.Get("name").String())
+		firstNamespace = truncateLogToken(item.Get("namespace").String())
+		firstOutputIsString = item.Get("output").Type == gjson.String
+		return true
+	})
+	return []zap.Field{
+		zap.String("output_name", firstName),
+		zap.String("output_namespace", firstNamespace),
+		zap.Bool("output_is_string", firstOutputIsString),
+		zap.Bool("has_tool_call", hasToolCall),
+		zap.Int("missing_call_id_count", missing),
+	}
+}
+
+func isLoggedToolCallItemType(itemType string) bool {
+	switch itemType {
+	case "tool_call", "function_call", "local_shell_call", "tool_search_call", "custom_tool_call", "mcp_tool_call":
+		return true
+	default:
+		return strings.HasSuffix(itemType, "_call")
+	}
+}
+
+func truncateLogToken(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range value {
+		if n >= 64 {
+			break
+		}
+		if r < 0x20 || r == 0x7f {
+			r = ' '
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return b.String()
+}
+
+// normalizeOrphanFunctionCallOutputs rewrites standalone tool results that HTTP
+// Responses cannot continue. A function_call_output with no call_id and no paired
+// tool call in the same input becomes a developer message. Items that already have
+// a call_id, and requests that already have tool-call context or previous_response_id,
+// stay untouched.
+func normalizeOrphanFunctionCallOutputs(body []byte) ([]byte, bool) {
+	if !hasUniqueJSONMembers(body) {
+		return body, false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var request map[string]any
+	if err := decoder.Decode(&request); err != nil {
+		return body, false
+	}
+	if previousResponseID, exists := request["previous_response_id"]; exists {
+		value, ok := previousResponseID.(string)
+		if !ok || strings.TrimSpace(value) != "" {
+			return body, false
+		}
+	}
+	input, ok := request["input"].([]any)
+	if !ok {
+		return body, false
+	}
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if !isLoggedToolCallItemType(strings.TrimSpace(stringField(item, "type"))) {
+			continue
+		}
+		callID, isString := item["call_id"].(string)
+		if isString && strings.TrimSpace(callID) != "" {
+			return body, false
+		}
+	}
+
+	changed := false
+	for i, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok || strings.TrimSpace(stringField(item, "type")) != "function_call_output" {
+			continue
+		}
+		if callID, exists := item["call_id"]; exists {
+			text, isString := callID.(string)
+			if !isString || strings.TrimSpace(text) != "" {
+				continue
+			}
+		}
+		text, ok := orphanFunctionCallOutputText(item["output"])
+		if !ok {
+			continue
+		}
+		name := strings.TrimSpace(stringField(item, "name"))
+		namespace := strings.TrimSpace(stringField(item, "namespace"))
+		switch {
+		case namespace != "" && name != "":
+			text = namespace + "/" + name + ":\n" + text
+		case name != "":
+			text = name + ":\n" + text
+		case namespace != "":
+			text = namespace + ":\n" + text
+		}
+		input[i] = map[string]any{
+			"type": "message",
+			"role": "developer",
+			"content": []any{map[string]any{
+				"type": "input_text",
+				"text": text,
+			}},
+		}
+		changed = true
+	}
+	if !changed {
+		return body, false
+	}
+	normalized, err := json.Marshal(request)
+	if err != nil {
+		return body, false
+	}
+	return normalized, true
+}
+
+func orphanFunctionCallOutputText(output any) (string, bool) {
+	switch value := output.(type) {
+	case string:
+		return value, true
+	case []any:
+		parts := make([]string, 0, len(value))
+		for _, part := range value {
+			item, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			text, _ := item["text"].(string)
+			if text == "" {
+				continue
+			}
+			parts = append(parts, text)
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n"), true
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return "", false
+		}
+		return string(raw), true
+	case nil:
+		return "", true
+	default:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return "", false
+		}
+		return string(raw), true
+	}
 }
 
 func normalizeCodexDelegationBootstrap(body []byte) ([]byte, bool) {
