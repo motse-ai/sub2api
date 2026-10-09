@@ -50,6 +50,59 @@ func TestForwardAsAnthropic_BufferedResponseFailed_ReturnsError(t *testing.T) {
 	require.Equal(t, http.StatusBadGateway, rec.Code, "should write 502 for non-failover failed response")
 }
 
+func TestForwardAsAnthropic_StreamingEncryptedReasoningRetriesOnceOnSameAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.4","max_tokens":32,"stream":true,"messages":[` +
+		`{"role":"user","content":"hello"},` +
+		`{"role":"assistant","content":[{"type":"thinking","thinking":"plan","signature":"anthropic-thinking-v1:deadbeef"},{"type":"text","text":"ok"}]},` +
+		`{"role":"user","content":"continue"}]}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	failed := strings.Join([]string{
+		`event: error`,
+		`data: {"type":"error","error":{"type":"api_error","message":"The encrypted content PgpMabcjP1Z could not be verified. Reason: Encrypted content could not be decrypted or parsed."}}`,
+		"",
+		`data: [DONE]`,
+		"",
+	}, "\n")
+	okStream := strings.Join([]string{
+		`data: {"type":"response.completed","response":{"id":"resp_retry_ok","object":"response","model":"gpt-5.4","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"continued"}]}],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(failed)),
+		},
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(okStream)),
+		},
+	}}
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+	}
+
+	_, err := svc.ForwardAsAnthropic(context.Background(), c, rawChatCompletionsTestAccount(), body, "", "")
+
+	require.NoError(t, err)
+	require.Len(t, upstream.bodies, 2)
+	require.Contains(t, string(upstream.bodies[0]), "anthropic-thinking-v1:deadbeef")
+	require.NotContains(t, string(upstream.bodies[1]), "anthropic-thinking-v1:deadbeef")
+	require.Contains(t, rec.Body.String(), "continued")
+	require.NotContains(t, rec.Body.String(), "could not be decrypted")
+	require.NotEqual(t, http.StatusBadGateway, rec.Code)
+}
+
 func TestForwardAsAnthropic_StreamingResponseFailed_ReturnsError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
