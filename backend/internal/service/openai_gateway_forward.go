@@ -1045,6 +1045,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 
 	httpInvalidEncryptedContentRetryTried := false
+	encryptedReasoningStreamRetried := false
 	compactModelFallbackRetried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
@@ -1239,6 +1240,21 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if reqStream {
 			streamResult, err := s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, upstreamModel, reasoningEffortValue)
 			if err != nil {
+				if nextBody, retry, terminalErr := consumeOpenAIEncryptedReasoningStreamRetry(body, err, &encryptedReasoningStreamRetried, c); terminalErr != nil {
+					if resp != nil && resp.Body != nil {
+						_ = resp.Body.Close()
+					}
+					return nil, terminalErr
+				} else if retry {
+					body = nextBody
+					requestView = newOpenAIRequestView(body)
+					reqBody = nil
+					if resp != nil && resp.Body != nil {
+						_ = resp.Body.Close()
+					}
+					logger.LegacyPrintf("service.openai_gateway", "openai responses: retrying once after stripping unverifiable encrypted reasoning (account: %s)", account.Name)
+					continue
+				}
 				if signal, ok := asOpenAICompactFallbackSignal(err); ok {
 					if retryBody, fallbackModel, retry := s.prepareOpenAICompactFallbackRetry(
 						c, account, requestedModel, body, http.StatusBadRequest, signal.message, signal.payload, compactModelFallbackRetried,
