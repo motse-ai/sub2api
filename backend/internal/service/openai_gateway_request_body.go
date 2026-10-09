@@ -355,6 +355,47 @@ func isOpenAIEncryptedReasoningVerifyFailure(message string) bool {
 		strings.Contains(msg, "could not be decrypted or parsed")
 }
 
+// openAIEncryptedReasoningRetryBody strips replayed reasoning ciphertext for
+// one same-account retry. Decode or trim failures return ok=false so the
+// caller surfaces the original upstream error instead of sending an unchanged body.
+func openAIEncryptedReasoningRetryBody(body []byte) ([]byte, bool, error) {
+	var decoded map[string]any
+	if err := decodeOpenAIJSONUseNumber(body, &decoded); err != nil {
+		return nil, false, nil
+	}
+	if !trimOpenAIEncryptedReasoningItems(decoded) {
+		return nil, false, nil
+	}
+	out, err := marshalOpenAIUpstreamJSON(decoded)
+	if err != nil {
+		return nil, false, fmt.Errorf("serialize encrypted reasoning retry body: %w", err)
+	}
+	return out, true, nil
+}
+
+// consumeOpenAIEncryptedReasoningStreamRetry turns an HTTP 200 SSE
+// reasoning-ciphertext rejection into one same-account replay. A second
+// rejection, a no-op trim, or output already written becomes a normal upstream
+// failure so the client still receives an error.
+func consumeOpenAIEncryptedReasoningStreamRetry(body []byte, err error, alreadyRetried *bool, c *gin.Context) (next []byte, retry bool, terminal error) {
+	var encryptedErr *openAIEncryptedReasoningStreamError
+	if !errors.As(err, &encryptedErr) {
+		return nil, false, nil
+	}
+	if alreadyRetried == nil || *alreadyRetried || openAIStreamClientOutputStarted(c, false) {
+		return nil, false, fmt.Errorf("upstream response failed: %s", encryptedErr.message)
+	}
+	nextBody, ok, trimErr := openAIEncryptedReasoningRetryBody(body)
+	if trimErr != nil {
+		return nil, false, trimErr
+	}
+	if !ok {
+		return nil, false, fmt.Errorf("upstream response failed: %s", encryptedErr.message)
+	}
+	*alreadyRetried = true
+	return nextBody, true, nil
+}
+
 func trimOpenAIEncryptedReasoningItems(reqBody map[string]any) bool {
 	if len(reqBody) == 0 {
 		return false
