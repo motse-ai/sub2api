@@ -1636,6 +1636,15 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
 		strings.Contains(combined, "please retry")
 }
 
+func isOpenAIResponseProtectionUnavailable(message string, payload []byte) bool {
+	combined := strings.ToLower(strings.TrimSpace(message))
+	if len(payload) > 0 && gjson.ValidBytes(payload) {
+		combined += " " + strings.ToLower(gjson.GetBytes(payload, "error.message").String())
+		combined += " " + strings.ToLower(gjson.GetBytes(payload, "response.error.message").String())
+	}
+	return strings.Contains(combined, "response protection is unavailable")
+}
+
 func (s *OpenAIGatewayService) handleOpenAIStreamTerminalAccountSideEffects(
 	c *gin.Context,
 	account *Account,
@@ -1789,6 +1798,11 @@ func (s *OpenAIGatewayService) newOpenAIStreamFailoverErrorWithModel(
 		classificationHeaders = nil
 	}
 	failoverErr := s.newOpenAIAccountFailoverErrorWithClassificationHeaders(account, statusCode, headers, classificationHeaders, payload, message, shouldDisable, retryableOnSameAccount)
+	if isOpenAIResponseProtectionUnavailable(message, payload) {
+		// One other account. If that account returns the same phrase, stop
+		// instead of spending the configured switch budget (default 10).
+		failoverErr.AccountSwitchBudget = 1
+	}
 	if failoverErr.IsCredentialFailure() || failoverErr.RequestScopedTransient {
 		return failoverErr
 	}
