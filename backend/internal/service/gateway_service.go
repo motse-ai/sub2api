@@ -702,6 +702,9 @@ type UpstreamFailoverError struct {
 	NextAccountAction        NextAccountAction
 	ClientStatusCode         int
 	ClientMessage            string
+	// AccountSwitchBudget caps how many times this error may move to another
+	// account. Zero keeps the handler's configured max.
+	AccountSwitchBudget int
 }
 
 func (e *UpstreamFailoverError) Error() string {
@@ -713,6 +716,16 @@ func (e *UpstreamFailoverError) Error() string {
 
 func (e *UpstreamFailoverError) ShouldRetryNextAccount() bool {
 	return e != nil && e.NextAccountAction != NextAccountStop
+}
+
+// AccountSwitchLimit is the number of account switches allowed for this error.
+// A positive AccountSwitchBudget tighter than the handler max wins, so one
+// request cannot walk the whole pool.
+func (e *UpstreamFailoverError) AccountSwitchLimit(configuredMax int) int {
+	if e != nil && e.AccountSwitchBudget > 0 && (configuredMax <= 0 || e.AccountSwitchBudget < configuredMax) {
+		return e.AccountSwitchBudget
+	}
+	return configuredMax
 }
 
 func (e *UpstreamFailoverError) IsCredentialFailure() bool {

@@ -256,3 +256,32 @@ func TestNonStreamingTerminalFailureFailover_NilAccountProposesNothing(t *testin
 		c, newNonStreamingSSEResponse(), nil, false, "response.failed", payload,
 		"Selected model is at capacity. Please try a different model."))
 }
+
+// ChatGPT Codex 对这段历史回裸 error「response protection is unavailable」，
+// 不跟 response.failed。保守分类器原先不换号，网关再合成 failed 写回客户端，
+// 会话就钉在原账号上。字还没写出时要换一个号，并且只再试一个号。
+func TestResponseProtectionUnavailableBareErrorFailsOverOnce(t *testing.T) {
+	const data = `{"type":"error","error":{"code":"upstream_error","type":"internal_error","message":"response protection is unavailable"}}`
+	payload := []byte(data)
+	message := extractOpenAISSEErrorMessage(payload)
+
+	require.True(t, openAIStreamErrorEventShouldFailover(payload, message))
+	require.True(t, openAIStreamFailedEventShouldFailover(payload, message))
+	require.False(t, openAIStreamDataStartsClientOutput(data, "error"))
+
+	c, rec := newNonStreamingFailoverContext(t)
+	svc := newNonStreamingFailoverService()
+	result, err := svc.handleSSEToJSON(newNonStreamingSSEResponse(), c,
+		newNonStreamingFailoverAccount(), sseTerminalBody("error", data), "gpt-5.6-terra", "gpt-5.6-terra")
+
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, 1, failoverErr.AccountSwitchBudget)
+	require.Equal(t, 1, failoverErr.AccountSwitchLimit(10))
+	require.Equal(t, 10, (&UpstreamFailoverError{}).AccountSwitchLimit(10))
+	require.True(t, failoverErr.ShouldRetryNextAccount())
+	require.False(t, failoverErr.RetryableOnSameAccount)
+	require.False(t, c.Writer.Written())
+	require.Empty(t, rec.Body.String())
+}
