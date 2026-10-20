@@ -108,6 +108,39 @@ func TestOpenAIHTTPCapacityShedIsRequestScopedForOAuthAccounts(t *testing.T) {
 	require.Zero(t, repo.tempUnschedCalls)
 }
 
+func TestOpenAICapacityShedHonorsExplicitTempUnschedRule(t *testing.T) {
+	payload := []byte(`{"error":{"type":"server_error","message":"Our servers are currently overloaded. Please try again later."}}`)
+	account := &Account{
+		ID:       1,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeOAuth,
+		Credentials: map[string]any{
+			"temp_unschedulable_enabled": true,
+			"temp_unschedulable_rules": []any{
+				map[string]any{
+					"error_code":       503,
+					"keywords":         []any{"overloaded", "at capacity"},
+					"duration_minutes": 1,
+					"description":      "capacity",
+					"scope":            "account",
+				},
+			},
+		},
+	}
+	repo := &capacityShedAccountRepoStub{}
+	gateway := &OpenAIGatewayService{rateLimitService: NewRateLimitService(repo, nil, &config.Config{}, nil, nil)}
+
+	require.True(t, gateway.handleOpenAIAccountUpstreamError(
+		context.Background(),
+		account,
+		http.StatusServiceUnavailable,
+		nil,
+		payload,
+		"gpt-6.1-sol",
+	))
+	require.Equal(t, 1, repo.tempUnschedCalls)
+}
+
 // 上游降载的真实序列是「event: error → event: response.failed」。error 帧不算
 // 客户端输出：若把它当首输出 flush，clientOutputStarted 被固化，随后的 failed
 // 事件就进不了 pre-output failover 分支，只能把致命错误原样转发给客户端。

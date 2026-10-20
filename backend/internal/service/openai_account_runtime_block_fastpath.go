@@ -92,6 +92,24 @@ func isOpenAIAccount(account *Account) bool {
 
 // handleOpenAIAccountUpstreamError expects canonicalModel to be the model used
 // for scheduling after applying account mapping exactly once.
+//
+// openAICapacityShedTempUnschedApplies reports whether an explicit account rule
+// wants this capacity/overload body to pause scheduling. The default path still
+// treats capacity as request-scoped.
+func openAICapacityShedTempUnschedApplies(account *Account, statusCode int, responseBody []byte, canonicalModel ...string) bool {
+	if account == nil || !account.IsTempUnschedulableEnabled() || len(responseBody) == 0 {
+		return false
+	}
+	model := ""
+	if len(canonicalModel) > 0 {
+		model = strings.TrimSpace(canonicalModel[0])
+	}
+	if !tempUnschedRulesApply(account, statusCode, responseBody, model) {
+		return false
+	}
+	return len(matchTempUnschedulableRules(account, statusCode, responseBody)) > 0
+}
+
 func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte, canonicalModel ...string) bool {
 	if account != nil && account.Platform == PlatformGrok && isGrokContentPolicyRejection(statusCode, responseBody) {
 		return false
@@ -102,8 +120,10 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 		scheduleOpenCodeGoUsageActivity(s.deferredService, account)
 	}
 	// Capacity shedding describes this request, not account health. Keep the
-	// account schedulable while the request-local retry budget handles recovery.
-	if account != nil && account.Platform == PlatformOpenAI && isOpenAIRequestScopedCapacityShed("", responseBody) {
+	// account schedulable while the request-local retry budget handles recovery,
+	// unless the account has an explicit temp-unschedulable rule for this body.
+	if account != nil && account.Platform == PlatformOpenAI && isOpenAIRequestScopedCapacityShed("", responseBody) &&
+		!openAICapacityShedTempUnschedApplies(account, statusCode, responseBody, canonicalModel...) {
 		return false
 	}
 	stateCtx, cancel := openAIAccountStateContext(ctx)
