@@ -607,7 +607,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 						}
 					}
 				}
-				if !outputStarted && !cyberHit && isOpenAIEncryptedReasoningVerifyFailure(failedMessage) {
+				if !outputStarted && !cyberHit && (isOpenAIEncryptedReasoningVerifyFailure(failedMessage) || isOpenAIEncryptedFunctionOutputFailure(failedMessage)) {
 					streamEarlyErr = &openAIEncryptedReasoningStreamError{message: failedMessage}
 					return
 				}

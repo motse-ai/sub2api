@@ -171,6 +171,11 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			body = nextBody
 		}
 
+		if strippedBody, stripped, stripErr := stripOpenAIEncryptedFunctionOutputs(body); stripErr != nil {
+			return nil, stripErr
+		} else if stripped {
+			body = strippedBody
+		}
 		normalizedBody, normalized, err := normalizeOpenAIPassthroughOAuthBody(body, isOpenAIResponsesCompactPath(c))
 		if err != nil {
 			return nil, err
@@ -2171,7 +2176,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 						}
 					}
 				}
-				if !outputStarted && !cyberHit && isOpenAIEncryptedReasoningVerifyFailure(failedMessage) {
+				if !outputStarted && !cyberHit && (isOpenAIEncryptedReasoningVerifyFailure(failedMessage) || isOpenAIEncryptedFunctionOutputFailure(failedMessage)) {
 					return resultWithUsage(), &openAIEncryptedReasoningStreamError{message: failedMessage}
 				}
 				forceFlushFailedEvent = true

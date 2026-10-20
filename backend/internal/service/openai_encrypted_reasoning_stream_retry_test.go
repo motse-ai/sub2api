@@ -3,6 +3,7 @@
 package service
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestResponsesStreamEncryptedReasoningFailureRetriesBeforeWrite(t *testing.T) {
@@ -60,6 +62,75 @@ func TestResponsesStreamEncryptedReasoningFailureRetriesBeforeWrite(t *testing.T
 	}
 }
 
+func TestStripEncryptedFunctionOutputKeepsPlaintextAndCallID(t *testing.T) {
+	body := []byte(`{"model":"gpt-6.1-sol","input":[` +
+		`{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},` +
+		`{"type":"function_call_output","call_id":"call_1","output":"visible result","encrypted_content":"cipher"},` +
+		`{"type":"function_call_output","call_id":"call_cipher_only","encrypted_content":"cipher-only"}` +
+		`]}`)
+
+	stripped, changed, err := stripOpenAIEncryptedFunctionOutputs(body)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "function_call_output", gjson.GetBytes(stripped, "input.1.type").String())
+	require.Equal(t, "call_1", gjson.GetBytes(stripped, "input.1.call_id").String())
+	require.Equal(t, "visible result", gjson.GetBytes(stripped, "input.1.output").String())
+	require.False(t, gjson.GetBytes(stripped, "input.1.encrypted_content").Exists())
+	require.Equal(t, 2, int(gjson.GetBytes(stripped, "input.#").Int()), "ciphertext without plaintext cannot be replayed")
+
+	_, changed, err = stripOpenAIEncryptedFunctionOutputs(stripped)
+	require.NoError(t, err)
+	require.False(t, changed)
+}
+
+func TestResponsesStreamEncryptedFunctionOutputRetriesBeforeWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader("event: error\n" +
+				`data: {"type":"error","error":{"code":"invalid_encrypted_content","message":"Encrypted function output content could not be decrypted or decoded."}}` + "\n\n")),
+		},
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: io.NopCloser(strings.NewReader("event: response.output_text.delta\n" +
+				`data: {"type":"response.output_text.delta","delta":"ok"}` + "\n\n" +
+				"event: response.completed\n" +
+				`data: {"type":"response.completed","response":{"id":"resp_retry","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}` + "\n\n")),
+		},
+	}}
+	body := []byte(`{"model":"gpt-6.1-sol","stream":true,"input":[{"type":"function_call_output","call_id":"call_1","output":"visible result","encrypted_content":"cipher"}]}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	svc := &OpenAIGatewayService{
+		cfg:          &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}},
+		httpUpstream: upstream,
+	}
+	account := &Account{
+		ID:       244,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://api.openai.com/v1",
+		},
+		Status:      StatusActive,
+		Schedulable: true,
+	}
+
+	_, err := svc.forwardOpenAIPassthrough(c.Request.Context(), c, account, body, body, "gpt-6.1-sol", false, nil, true, time.Now())
+	require.NoError(t, err)
+	require.Len(t, upstream.bodies, 2)
+	require.False(t, gjson.GetBytes(upstream.bodies[1], "input.0.encrypted_content").Exists())
+	require.Equal(t, "visible result", gjson.GetBytes(upstream.bodies[1], "input.0.output").String())
+	require.Equal(t, "call_1", gjson.GetBytes(upstream.bodies[1], "input.0.call_id").String())
+	require.NotContains(t, rec.Body.String(), "could not be decrypted")
+}
+
 func TestResponsesStreamEncryptedFunctionOutputStillReachesClient(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	stream := "event: error\n" +
@@ -75,7 +146,6 @@ func TestResponsesStreamEncryptedFunctionOutputStillReachesClient(t *testing.T) 
 	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{MaxLineSize: defaultMaxLineSize}}}
 	_, err := svc.handleStreamingResponsePassthrough(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}, time.Now(), "gpt-5.6-sol", "gpt-5.6-sol")
 
-	var encryptedErr *openAIEncryptedReasoningStreamError
-	require.NotErrorAs(t, err, &encryptedErr)
-	require.Contains(t, rec.Body.String(), "could not be decrypted or decoded")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "could not be decrypted or decoded")
 }

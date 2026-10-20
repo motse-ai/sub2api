@@ -356,6 +356,12 @@ func isOpenAIEncryptedReasoningVerifyFailure(message string) bool {
 		strings.Contains(msg, "could not be decrypted or parsed")
 }
 
+func isOpenAIEncryptedFunctionOutputFailure(message string) bool {
+	msg := strings.ToLower(strings.TrimSpace(message))
+	return strings.Contains(msg, "encrypted function output") &&
+		strings.Contains(msg, "could not be decrypted")
+}
+
 // openAIEncryptedReasoningRetryBody strips replayed reasoning ciphertext for
 // one same-account retry. Decode or trim failures return ok=false so the
 // caller surfaces the original upstream error instead of sending an unchanged body.
@@ -386,7 +392,16 @@ func consumeOpenAIEncryptedReasoningStreamRetry(body []byte, err error, alreadyR
 	if alreadyRetried == nil || *alreadyRetried || openAIStreamClientOutputStarted(c, false) {
 		return nil, false, fmt.Errorf("upstream response failed: %s", encryptedErr.message)
 	}
-	nextBody, ok, trimErr := openAIEncryptedReasoningRetryBody(body)
+	var (
+		nextBody []byte
+		ok       bool
+		trimErr  error
+	)
+	if isOpenAIEncryptedFunctionOutputFailure(encryptedErr.message) {
+		nextBody, ok, trimErr = stripOpenAIEncryptedFunctionOutputs(body)
+	} else {
+		nextBody, ok, trimErr = openAIEncryptedReasoningRetryBody(body)
+	}
 	if trimErr != nil {
 		return nil, false, trimErr
 	}
@@ -395,6 +410,70 @@ func consumeOpenAIEncryptedReasoningStreamRetry(body []byte, err error, alreadyR
 	}
 	*alreadyRetried = true
 	return nextBody, true, nil
+}
+
+// stripOpenAIEncryptedFunctionOutputs removes ciphertext from tool results.
+// A result that still has plaintext output keeps that output and call_id.
+// Ciphertext with no plaintext cannot be recovered, so the item is dropped
+// before the next upstream attempt replays it.
+func stripOpenAIEncryptedFunctionOutputs(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 || !bytes.Contains(body, []byte(`"encrypted_content"`)) {
+		return body, false, nil
+	}
+	var decoded map[string]any
+	if err := decodeOpenAIJSONUseNumber(body, &decoded); err != nil {
+		return nil, false, nil
+	}
+	if !stripOpenAIEncryptedFunctionOutputItems(decoded) {
+		return body, false, nil
+	}
+	out, err := marshalOpenAIUpstreamJSON(decoded)
+	if err != nil {
+		return nil, false, fmt.Errorf("serialize encrypted function output retry body: %w", err)
+	}
+	return out, true, nil
+}
+
+func openAIFunctionOutputHasPlaintext(output any) bool {
+	switch typed := output.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(typed) != ""
+	default:
+		return true
+	}
+}
+
+func stripOpenAIEncryptedFunctionOutputItems(reqBody map[string]any) bool {
+	input, ok := reqBody["input"].([]any)
+	if !ok {
+		return false
+	}
+	filtered := make([]any, 0, len(input))
+	changed := false
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if !ok || strings.TrimSpace(firstNonEmptyString(item["type"])) != "function_call_output" {
+			filtered = append(filtered, raw)
+			continue
+		}
+		if _, encrypted := item["encrypted_content"]; !encrypted {
+			filtered = append(filtered, raw)
+			continue
+		}
+		changed = true
+		delete(item, "encrypted_content")
+		if !openAIFunctionOutputHasPlaintext(item["output"]) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	if !changed {
+		return false
+	}
+	reqBody["input"] = filtered
+	return true
 }
 
 func trimOpenAIEncryptedReasoningItems(reqBody map[string]any) bool {
