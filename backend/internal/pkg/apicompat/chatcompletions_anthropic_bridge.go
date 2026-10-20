@@ -53,7 +53,7 @@ func AnthropicToChatCompletionsRequest(req *AnthropicRequest) (*ChatCompletionsR
 // AnthropicToChatCompletionsRequestWithMinOutputTokens converts an Anthropic
 // Messages request using the supplied max_completion_tokens floor.
 func AnthropicToChatCompletionsRequestWithMinOutputTokens(req *AnthropicRequest, minOutputTokens int) (*ChatCompletionsRequest, error) {
-	return AnthropicToChatCompletionsRequestWithOptions(req, nil, minOutputTokens)
+	return AnthropicToChatCompletionsRequestWithOptionsAndMinOutputTokens(req, nil, minOutputTokens)
 }
 
 func AnthropicToChatCompletionsRequestWithOptions(req *AnthropicRequest, opts *AnthropicToChatCompletionsOptions) (*ChatCompletionsRequest, error) {
