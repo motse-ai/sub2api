@@ -2280,6 +2280,143 @@ func TestForwardGrokResponsesInvalidEncryptedContentRecoveryDoesNotOvermatch(t *
 	}
 }
 
+func TestTrimGrokContextWindowRetryBodyDropsOnlyOpaqueReplay(t *testing.T) {
+	body := []byte(`{"model":"grok-4.7","input":[
+		{"type":"reasoning","summary":[{"type":"summary_text","text":"keep this summary"}],"encrypted_content":"opaque-reasoning"},
+		{"type":"compaction","encrypted_content":"opaque-compaction","summary":[{"type":"summary_text","text":"keep compaction summary"}]},
+		{"type":"message","role":"user","content":"continue"}
+	]}`)
+
+	retry, changed, err := trimGrokContextWindowRetryBody(body, []byte(`{"error":"[input_too_large] (500382 tokens > 500000 tokens)"}`))
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.False(t, gjson.GetBytes(retry, "input.0.encrypted_content").Exists())
+	require.Equal(t, "keep this summary", gjson.GetBytes(retry, "input.0.summary.0.text").String())
+	require.False(t, gjson.GetBytes(retry, `input.#(type=="compaction")`).Exists())
+	require.Equal(t, "continue", gjson.GetBytes(retry, "input.2.content").String())
+	require.Equal(t, "keep compaction summary", gjson.GetBytes(retry, `input.#(content.0.text=="keep compaction summary").content.0.text`).String())
+
+	unchanged, changed, err := trimGrokContextWindowRetryBody([]byte(`{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"hi"}]}`), []byte(`{"error":"[input_too_large] (500382 tokens > 500000 tokens)"}`))
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.JSONEq(t, `{"model":"grok-4.7","input":[{"type":"message","role":"user","content":"hi"}]}`, string(unchanged))
+}
+
+func TestForwardGrokResponsesRetriesInputTooLargeOnce(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	body := []byte(`{"model":"grok-4.7","input":[
+		{"type":"reasoning","summary":[{"type":"summary_text","text":"kept summary"}],"encrypted_content":"opaque"},
+		{"type":"message","role":"user","content":"continue"}
+	],"stream":false}`)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+
+	account := &Account{
+		ID:          4539,
+		Name:        "grok-api-key",
+		Platform:    PlatformGrok,
+		Type:        AccountTypeAPIKey,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"api_key": "token", "base_url": "https://api.x.ai/v1"},
+	}
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{
+			StatusCode: http.StatusBadRequest,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":"invalid-argument","error":"Failed to start sampling: [input_too_large] The prompt is too long for this model's context window (500382 tokens > 500000 tokens)"}`)),
+		},
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_trimmed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}`)),
+		},
+	}}
+	svc := &OpenAIGatewayService{httpUpstream: upstream}
+
+	result, err := svc.forwardGrokResponses(context.Background(), c, account, body, "grok-4.7", false, time.Now())
+	require.NoError(t, err)
+	require.Equal(t, "resp_trimmed", result.ResponseID)
+	require.Len(t, upstream.bodies, 2)
+	require.Equal(t, "opaque", gjson.GetBytes(upstream.bodies[0], "input.0.encrypted_content").String())
+	require.False(t, gjson.GetBytes(upstream.bodies[1], "input.0.encrypted_content").Exists())
+	require.Equal(t, "kept summary", gjson.GetBytes(upstream.bodies[1], "input.0.summary.0.text").String())
+	require.Equal(t, "continue", gjson.GetBytes(upstream.bodies[1], "input.1.content").String())
+}
+
+func TestTrimGrokContextWindowRetryBodyDropsOldestHistoryByReportedOverflow(t *testing.T) {
+	items := make([]string, 0, 101)
+	for i := 0; i < 100; i++ {
+		items = append(items, fmt.Sprintf(`{"type":"message","role":"user","content":"old turn %d"}`, i))
+	}
+	items = append(items, `{"type":"message","role":"user","content":"keep the latest request"}`)
+	body := []byte(`{"model":"grok-4.7","input":[` + strings.Join(items, ",") + `]}`)
+	upstream := []byte(`{"code":"invalid-argument","error":"Failed to start sampling: [input_too_large] The prompt is too long for this model's context window (500421 tokens > 500000 tokens)"}`)
+
+	retry, changed, err := trimGrokContextWindowRetryBody(body, upstream)
+	require.NoError(t, err)
+	require.True(t, changed)
+	// 421/500000 of 100 droppable items rounds up to one item.
+	require.Equal(t, int64(100), gjson.GetBytes(retry, "input.#").Int())
+	require.Equal(t, "old turn 1", gjson.GetBytes(retry, "input.0.content").String())
+	require.Equal(t, "keep the latest request", gjson.GetBytes(retry, "input.99.content").String())
+	require.False(t, bytes.Contains(retry, []byte("old turn 0\"")))
+
+	// Tool calls stay paired with their outputs, and the latest item stays.
+	paired := []byte(`{"model":"grok-4.7","input":[
+		{"type":"function_call","call_id":"call_old","name":"lookup","arguments":"{}"},
+		{"type":"function_call_output","call_id":"call_old","output":"old result"},
+		{"type":"message","role":"user","content":"keep the latest request"}
+	]}`)
+	retry, changed, err = trimGrokContextWindowRetryBody(paired, []byte(`{"error":"[input_too_large] (600000 tokens > 500000 tokens)"}`))
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, int64(1), gjson.GetBytes(retry, "input.#").Int())
+	require.Equal(t, "keep the latest request", gjson.GetBytes(retry, "input.0.content").String())
+	require.False(t, bytes.Contains(retry, []byte("call_old")))
+}
+
+func TestTrimGrokContextWindowRetryBodySecondPassUsesRemainder(t *testing.T) {
+	items := make([]string, 0, 11)
+	for i := 0; i < 10; i++ {
+		items = append(items, fmt.Sprintf(`{"type":"message","role":"user","content":"turn %d"}`, i))
+	}
+	items = append(items, `{"type":"message","role":"user","content":"latest"}`)
+	body := []byte(`{"model":"grok-4.7","input":[` + strings.Join(items, ",") + `]}`)
+
+	first, changed, err := trimGrokContextWindowRetryBody(body, []byte(`{"error":"[input_too_large] (550000 tokens > 500000 tokens)"}`))
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, int64(9), gjson.GetBytes(first, "input.#").Int())
+
+	second, changed, err := trimGrokContextWindowRetryBody(first, []byte(`{"error":"[input_too_large] (500042 tokens > 500000 tokens)"}`))
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Less(t, gjson.GetBytes(second, "input.#").Int(), gjson.GetBytes(first, "input.#").Int())
+	last := gjson.GetBytes(second, "input.#").Int() - 1
+	require.Equal(t, "latest", gjson.GetBytes(second, fmt.Sprintf("input.%d.content", last)).String())
+}
+
+func TestGrokInputTooLargeOverflowTokens(t *testing.T) {
+	body := []byte(`{"error":"The prompt is too long for this model's context window (500421 tokens > 500000 tokens)"}`)
+	overflow, limit, ok := grokInputTooLargeOverflow(body)
+	require.True(t, ok)
+	require.Equal(t, 421, overflow)
+	require.Equal(t, 500000, limit)
+	_, _, ok = grokInputTooLargeOverflow([]byte(`{"error":"input_too_large"}`))
+	require.False(t, ok)
+}
+
+func TestGrokInputTooLargeIsContextWindowRetry(t *testing.T) {
+	body := []byte(`{"code":"invalid-argument","error":"Failed to start sampling: [input_too_large] The prompt is too long for this model's context window (500382 tokens > 500000 tokens)"}`)
+	require.True(t, isGrokInputTooLargeResponse(http.StatusBadRequest, body))
+	require.False(t, isGrokInputTooLargeResponse(http.StatusBadRequest, []byte(`{"code":"invalid-argument","error":"Could not decrypt the provided encrypted_content."}`)))
+	require.False(t, isGrokInputTooLargeResponse(http.StatusTooManyRequests, body))
+}
+
 func TestGrokCompactionBlobRecoveryStripsCompactionItem(t *testing.T) {
 	body := []byte(`{"model":"grok","input":[{"type":"compaction","id":"cmp_1","encrypted_content":"blob"},{"type":"message","role":"user","content":"hi"}]}`)
 	require.True(t, isGrokInvalidEncryptedContentResponse(http.StatusUnprocessableEntity, []byte(`{"code":"invalid_compaction","error":"could not decode the compaction blob"}`)))

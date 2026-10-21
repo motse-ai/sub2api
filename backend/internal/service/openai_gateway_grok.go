@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -121,18 +123,27 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 		}
 
-		// xAI can reject encrypted reasoning or a compaction blob copied from a
-		// different decoder/cache context. Retry once on the same account after
-		// preserving visible summaries and removing only opaque replay state.
-		if attempt > 0 || (resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusUnprocessableEntity) {
+		// Encrypted-content and compaction decode failures are retried once.
+		// A context-window overflow can need a second trim: the first pass
+		// only has an estimate of bytes per token, and xAI reports the exact
+		// remainder on the retry.
+		if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusUnprocessableEntity {
+			break
+		}
+		if attempt > 1 {
 			break
 		}
 		respBody := s.readUpstreamErrorBody(resp)
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
+		if attempt > 0 && !isGrokInputTooLargeResponse(resp.StatusCode, respBody) {
+			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+			break
+		}
 		invalidEncryptedContent := isGrokInvalidEncryptedContentResponse(resp.StatusCode, respBody)
-		if !invalidEncryptedContent && !isGrokCompactionReplayDecodeError(resp.StatusCode, respBody) {
+		inputTooLarge := isGrokInputTooLargeResponse(resp.StatusCode, respBody)
+		if !invalidEncryptedContent && !inputTooLarge && !isGrokCompactionReplayDecodeError(resp.StatusCode, respBody) {
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 			break
 		}
@@ -140,21 +151,31 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		var retryBody []byte
 		var changed bool
 		var trimErr error
-		if invalidEncryptedContent {
+		switch {
+		case invalidEncryptedContent:
 			retryBody, changed, trimErr = trimGrokInvalidEncryptedContentRetryBody(patchedBody)
-		} else {
+		case inputTooLarge:
+			retryBody, changed, trimErr = trimGrokContextWindowRetryBody(patchedBody, respBody)
+		default:
 			retryBody, changed, trimErr = sanitizeGrokCompactionReplayBody(patchedBody)
 		}
 		if trimErr != nil {
 			return nil, fmt.Errorf("prepare Grok replay decode retry: %w", trimErr)
 		}
 		if !changed {
+			slog.Warn("grok_replay_decode_retry_noop",
+				"account_id", account.ID,
+				"input_too_large", inputTooLarge,
+				"body_bytes", len(patchedBody),
+				"encrypted_content_markers", bytes.Count(patchedBody, []byte(`"encrypted_content"`)),
+				"compaction_markers", bytes.Count(patchedBody, []byte(`"compaction"`)),
+			)
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 			break
 		}
 
 		patchedBody = retryBody
-		slog.Info("grok_replay_decode_retry", "account_id", account.ID, "cache_identity_present", cacheIdentity != "")
+		slog.Info("grok_replay_decode_retry", "account_id", account.ID, "cache_identity_present", cacheIdentity != "", "input_too_large", inputTooLarge)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -306,6 +327,20 @@ func isGrokInvalidEncryptedContentResponse(statusCode int, body []byte) bool {
 			return true
 		}
 		if strings.Contains(normalizedMessage, "decode the compaction blob") {
+			return true
+		}
+	}
+	return false
+}
+
+// isGrokInputTooLargeResponse matches xAI's hard context-window rejection:
+// {"code":"invalid-argument","error":"... [input_too_large] ... (500382 tokens > 500000 tokens)"}
+func isGrokInputTooLargeResponse(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest || len(body) == 0 {
+		return false
+	}
+	for _, candidate := range grokStructuredErrorMessageCandidates(body) {
+		if strings.Contains(strings.ToLower(candidate), "input_too_large") {
 			return true
 		}
 	}
@@ -477,6 +512,245 @@ func stripAnthropicThinkingSignatures(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return out, true
+}
+
+// grokContextWindowTrimTargetBytes is how much visible text one retry sheds
+// per overflow token. Production history measured about 4.4 bytes per token,
+// so 4 left a 42-token remainder. Two bytes per token clears that remainder
+// while still dropping only the oldest history.
+const grokContextWindowTrimTargetBytes = 2
+
+var grokInputTooLargeOverflowPattern = regexp.MustCompile(`\((\d+)\s+tokens\s*>\s*(\d+)\s+tokens\)`)
+
+func grokInputTooLargeOverflow(body []byte) (overflow, limit int, ok bool) {
+	matches := grokInputTooLargeOverflowPattern.FindSubmatch(body)
+	if len(matches) != 3 {
+		return 0, 0, false
+	}
+	used, err := strconv.Atoi(string(matches[1]))
+	if err != nil {
+		return 0, 0, false
+	}
+	limit, err = strconv.Atoi(string(matches[2]))
+	if err != nil || used <= limit || limit <= 0 {
+		return 0, 0, false
+	}
+	return used - limit, limit, true
+}
+
+// trimGrokContextWindowRetryBody sheds just enough of the oldest visible
+// history to cover the overflow xAI reported. Encrypted replay blobs are
+// removed first because they carry no visible meaning; otherwise the oldest
+// input items are shortened or dropped, and the latest item is always kept.
+func trimGrokContextWindowRetryBody(body, upstreamBody []byte) ([]byte, bool, error) {
+	var requestBody map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&requestBody); err != nil {
+		return nil, false, err
+	}
+
+	changed := trimGrokEncryptedReplayState(requestBody)
+	overflow, limit, ok := grokInputTooLargeOverflow(upstreamBody)
+	if ok && trimGrokOldestInput(requestBody, overflow, limit) {
+		changed = true
+	}
+	if !changed {
+		return body, false, nil
+	}
+	stripGrokTrimMarkers(requestBody)
+	retryBody, err := marshalOpenAIUpstreamJSON(requestBody)
+	if err != nil {
+		return nil, false, err
+	}
+	return retryBody, true, nil
+}
+
+func stripGrokTrimMarkers(requestBody map[string]any) {
+	items, ok := requestBody["input"].([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		delete(item, "grok_preserved_summary")
+	}
+}
+
+// trimGrokOldestInput drops the oldest fraction of input items that matches
+// the overflow xAI reported. Byte estimates do not work here: the failing
+// requests shed thousands of visible bytes and only a few hundred tokens,
+// because most of the window is held by items whose token cost is not in
+// their text. Item share is the signal the upstream count actually follows.
+// A tool call and its output are dropped together. The newest item stays.
+func trimGrokOldestInput(requestBody map[string]any, overflow, limit int) bool {
+	items, ok := requestBody["input"].([]any)
+	if !ok || len(items) < 2 || overflow <= 0 || limit <= 0 {
+		return false
+	}
+	droppable := 0
+	for i := 0; i < len(items)-1; i++ {
+		if !grokInputPreservedItem(items[i]) {
+			droppable++
+		}
+	}
+	if droppable == 0 {
+		return false
+	}
+	// Round up so a fractional item still removes one. Cap at every droppable
+	// item so a huge overflow cannot delete the newest message.
+	// A sub-percent overflow still has to remove at least one item, but it must
+	// not jump to two just because integer division rounds up. The second
+	// upstream response reports the real remainder if one item was not enough.
+	target := overflow*droppable/limit + 1
+	if target > droppable {
+		target = droppable
+	}
+	dropped := 0
+	kept := make([]any, 0, len(items))
+	for i := 0; i < len(items); i++ {
+		item := items[i]
+		if i == len(items)-1 || grokInputPreservedItem(item) || dropped >= target {
+			kept = append(kept, item)
+			continue
+		}
+		if grokInputCallGroup(items, i) {
+			end := i + 1
+			for end < len(items)-1 && grokInputCallGroup(items, end) {
+				end++
+			}
+			if dropped+end-i > target && dropped > 0 {
+				kept = append(kept, items[i:]...)
+				break
+			}
+			dropped += end - i
+			i = end - 1
+			continue
+		}
+		dropped++
+	}
+	if dropped == 0 || len(kept) == len(items) {
+		return false
+	}
+	requestBody["input"] = kept
+	return true
+}
+
+// grokInputPreservedItem keeps reasoning and compaction summaries. Those are
+// the compressed form of older history, so trimming them throws away more
+// context than the few hundred tokens xAI asked us to shed.
+func grokInputPreservedItem(item any) bool {
+	inputItem, ok := item.(map[string]any)
+	if !ok {
+		return false
+	}
+	switch strings.TrimSpace(stringValue(inputItem["type"])) {
+	case "reasoning", "compaction", "compaction_summary":
+		return true
+	}
+	preserved, _ := inputItem["grok_preserved_summary"].(bool)
+	return preserved
+}
+
+func grokInputCallGroup(items []any, index int) bool {
+	item, ok := items[index].(map[string]any)
+	if !ok {
+		return false
+	}
+	switch strings.TrimSpace(stringValue(item["type"])) {
+	case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
+func grokInputVisibleBytes(item any) int {
+	encoded, err := json.Marshal(item)
+	if err != nil {
+		return 0
+	}
+	return len(encoded)
+}
+
+func shortenGrokInputItem(item any, bytesToDrop int) bool {
+	inputItem, ok := item.(map[string]any)
+	if !ok || bytesToDrop <= 0 {
+		return false
+	}
+	switch content := inputItem["content"].(type) {
+	case string:
+		if len(content) <= bytesToDrop {
+			return false
+		}
+		inputItem["content"] = content[bytesToDrop:]
+		return true
+	case []any:
+		for _, rawPart := range content {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				continue
+			}
+			text, ok := part["text"].(string)
+			if !ok || len(text) <= bytesToDrop {
+				continue
+			}
+			part["text"] = text[bytesToDrop:]
+			return true
+		}
+	}
+	return false
+}
+
+// trimGrokEncryptedReplayState removes encrypted replay blobs while keeping
+// every visible summary. Compaction items become ordinary user messages so
+// xAI no longer has to decode the blob that pushed the prompt over the window.
+func trimGrokEncryptedReplayState(requestBody map[string]any) bool {
+	items, ok := requestBody["input"].([]any)
+	if !ok {
+		return false
+	}
+	rewritten := make([]any, 0, len(items))
+	changed := false
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			rewritten = append(rewritten, rawItem)
+			continue
+		}
+		switch strings.TrimSpace(stringValue(item["type"])) {
+		case "reasoning":
+			if _, has := item["encrypted_content"]; has {
+				delete(item, "encrypted_content")
+				changed = true
+			}
+			if len(item) > 1 {
+				rewritten = append(rewritten, item)
+			}
+		case "compaction", "compaction_summary":
+			changed = true
+			if summary := compactSummaryText(item["summary"]); summary != "" {
+				rewritten = append(rewritten, map[string]any{
+					"type": "message",
+					"role": "user",
+					"content": []any{map[string]any{
+						"type": "input_text",
+						"text": summary,
+					}},
+					"grok_preserved_summary": true,
+				})
+			}
+		default:
+			rewritten = append(rewritten, rawItem)
+		}
+	}
+	if changed {
+		requestBody["input"] = rewritten
+	}
+	return changed
 }
 
 func trimGrokInvalidEncryptedContentRetryBody(body []byte) ([]byte, bool, error) {
