@@ -129,6 +129,133 @@ func TestOpenAIGatewayService_APIKeyPreservesLiteDeclaredNamespaceToolCalls(t *t
 	require.False(t, gjson.GetBytes(forwarded, "input.2.namespace").Exists())
 }
 
+// Cursor 把 namespace 挂在 function 工具上，而不是 type=namespace 包裹。
+// 历史 function_call 若被清掉 namespace，上游会按默认命名空间解析 read_thread 并 400。
+func TestOpenAIGatewayService_APIKeyPreservesFunctionToolNamespaceField(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-6.1-sol",
+		"stream":false,
+		"tools":[
+			{"type":"function","name":"read_thread","namespace":"cursor","parameters":{"type":"object"}},
+			{"type":"function","name":"exec","parameters":{"type":"object"}}
+		],
+		"input":[
+			{"type":"function_call","namespace":"cursor","name":"read_thread","call_id":"call_read","arguments":"{}"},
+			{"type":"message","role":"user","namespace":"leftover","content":[{"type":"input_text","text":"hello"}]}
+		]
+	}`)
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		newOpenAIRejectedFieldTestResponse(http.StatusOK, namespaceForwardOKResponse),
+	}}
+	c := newOpenAIRejectedFieldTestContext(body)
+
+	result, err := newOpenAIRejectedFieldTestService(upstream).Forward(
+		context.Background(), c, newOpenAIRejectedFieldTestAccount(), body,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, upstream.bodies, 1)
+	forwarded := upstream.bodies[0]
+
+	require.Equal(t, "cursor", gjson.GetBytes(forwarded, "tools.0.namespace").String())
+	require.Equal(t, "read_thread", gjson.GetBytes(forwarded, "tools.0.name").String())
+	require.Equal(t, "cursor", gjson.GetBytes(forwarded, "input.0.namespace").String())
+	require.Equal(t, "read_thread", gjson.GetBytes(forwarded, "input.0.name").String())
+	require.False(t, gjson.GetBytes(forwarded, "input.1.namespace").Exists())
+}
+
+// Cursor 压缩回放会丢掉 function_call.namespace，但 tools 里仍声明 read_thread 属于
+// 某个 namespace。上游按默认命名空间解析这个名字就会 400，需要按声明补回字段。
+func TestOpenAIGatewayService_APIKeyFillsMissingNamespaceFromToolDeclaration(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "namespace wrapper",
+			body: `{
+				"model":"gpt-6.1-sol",
+				"stream":false,
+				"tools":[{"type":"namespace","name":"cursor","tools":[
+					{"type":"function","name":"read_thread","parameters":{"type":"object"}},
+					{"type":"function","name":"exec","parameters":{"type":"object"}}
+				]}],
+				"input":[
+					{"type":"function_call","name":"read_thread","call_id":"call_read","arguments":"{}"},
+					{"type":"function_call","name":"exec","call_id":"call_exec","arguments":"{}"},
+					{"type":"message","role":"user","namespace":"leftover","content":[{"type":"input_text","text":"hello"}]}
+				]
+			}`,
+		},
+		{
+			name: "function namespace field",
+			body: `{
+				"model":"gpt-6.1-sol",
+				"stream":false,
+				"tools":[{"type":"function","name":"read_thread","namespace":"cursor","parameters":{"type":"object"}}],
+				"input":[
+					{"type":"function_call","name":"read_thread","call_id":"call_read","arguments":"{}"},
+					{"type":"message","role":"user","namespace":"leftover","content":[{"type":"input_text","text":"hello"}]}
+				]
+			}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte(tt.body)
+			upstream := &httpUpstreamRecorder{responses: []*http.Response{
+				newOpenAIRejectedFieldTestResponse(http.StatusOK, namespaceForwardOKResponse),
+			}}
+			c := newOpenAIRejectedFieldTestContext(body)
+
+			result, err := newOpenAIRejectedFieldTestService(upstream).Forward(
+				context.Background(), c, newOpenAIRejectedFieldTestAccount(), body,
+			)
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Len(t, upstream.bodies, 1)
+			forwarded := upstream.bodies[0]
+			require.Equal(t, "cursor", gjson.GetBytes(forwarded, "input.0.namespace").String())
+			require.Equal(t, "read_thread", gjson.GetBytes(forwarded, "input.0.name").String())
+			require.False(t, gjson.GetBytes(forwarded, `input.#(type=="message").namespace`).Exists())
+		})
+	}
+}
+
+// Cursor 压缩后的请求不再带 namespace 工具声明，但 function_call 仍带着模型
+// 原样输出的 namespace。AIHubMix 要求原样回传，标准 Responses 账号则继续删掉。
+func TestOpenAIGatewayService_AIHubMixKeepsClientToolCallNamespaceWithoutDeclaration(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-6.1-sol",
+		"stream":false,
+		"tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}}],
+		"input":[
+			{"type":"function_call","name":"read_thread","namespace":"codex_app","call_id":"call_read","arguments":"{}"},
+			{"type":"message","role":"user","namespace":"leftover","content":[{"type":"input_text","text":"hello"}]}
+		]
+	}`)
+	account := newOpenAIRejectedFieldTestAccount()
+	account.Credentials["base_url"] = "https://aihubmix.com"
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		newOpenAIRejectedFieldTestResponse(http.StatusOK, namespaceForwardOKResponse),
+	}}
+	c := newOpenAIRejectedFieldTestContext(body)
+
+	result, err := newOpenAIRejectedFieldTestService(upstream).Forward(
+		context.Background(), c, account, body,
+	)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, upstream.bodies, 1)
+	forwarded := upstream.bodies[0]
+	require.Equal(t, "codex_app", gjson.GetBytes(forwarded, "input.0.namespace").String())
+	require.Equal(t, "read_thread", gjson.GetBytes(forwarded, "input.0.name").String())
+	require.False(t, gjson.GetBytes(forwarded, "input.1.namespace").Exists())
+}
+
 // compact 端点 schema 更窄：input[].namespace 会 400 Unknown parameter（issue #4761），
 // 且没有证据表明它接受 namespace 工具声明。compact 只做历史摘要、不需要模型寻址工具，
 // 因此保持既有的摊平 + 全量清理行为，不随默认值翻转扩大风险面。

@@ -78,9 +78,10 @@ func shouldStripOpenAIResponsesInputNamespaces(account *Account, transport OpenA
 //   - compact 端点的 schema 不含该字段，携带即 400 `Unknown parameter:
 //     input[N].namespace`（issue #4761 正文），故 compact 一律清理。
 //   - API Key 出口默认按标准 Responses API 处理并清理该字段；但当请求本身声明
-//     namespace 工具时（包括 Responses Lite 的 input[].additional_tools），上游显然
-//     使用了 namespace 扩展，此时必须保留调用项上的 namespace，否则声明与历史
-//     调用会失配并触发 Missing namespace。
+//     namespace 工具时（包括 Responses Lite 的 input[].additional_tools，以及
+//     Cursor 直接挂在 function/custom 工具上的 namespace 字段），上游显然使用了
+//     namespace 扩展，此时必须保留调用项上的 namespace，否则声明与历史调用会失配
+//     并触发 Missing namespace。
 //   - 摊平模式下调用项已被改写成平名，残留 namespace 指向的声明已不存在，一律清理。
 func shouldKeepOpenAIResponsesToolCallNamespaces(
 	account *Account,
@@ -96,12 +97,47 @@ func shouldKeepOpenAIResponsesToolCallNamespaces(
 		return false
 	}
 	if account.IsOpenAIApiKey() {
-		return hasOpenAIResponsesNamespaceToolDeclaration(body)
+		if hasOpenAIResponsesNamespaceToolDeclaration(body) {
+			return true
+		}
+		// Cursor compaction drops the namespace tool list but still round-trips
+		// function_call.namespace (codex_app). AIHubMix resolves read_thread with
+		// that field and 400s when it is removed. Official Responses accounts
+		// reject the field, so only this upstream keeps a client-supplied value.
+		return openAIResponsesAccountRequiresToolCallNamespace(account) &&
+			openAIResponsesToolCallsCarryNamespace(body)
 	}
 	if !account.IsOpenAIOAuthLike() {
 		return false
 	}
 	return !shouldFlattenOpenAIResponsesNamespaces(account, transport, passthroughEnabled, compactPath)
+}
+
+func openAIResponsesAccountRequiresToolCallNamespace(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	baseURL := strings.ToLower(strings.TrimSpace(account.GetOpenAIBaseURL()))
+	return strings.Contains(baseURL, "://aihubmix.com") || strings.Contains(baseURL, "://www.aihubmix.com")
+}
+
+func openAIResponsesToolCallsCarryNamespace(body []byte) bool {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return false
+	}
+	found := false
+	input.ForEach(func(_, item gjson.Result) bool {
+		if !isOpenAIResponsesToolCallItemType(item.Get("type").String()) {
+			return true
+		}
+		if strings.TrimSpace(item.Get("namespace").String()) == "" {
+			return true
+		}
+		found = true
+		return false
+	})
+	return found
 }
 
 func hasOpenAIResponsesNamespaceToolDeclaration(body []byte) bool {
@@ -111,7 +147,7 @@ func hasOpenAIResponsesNamespaceToolDeclaration(body []byte) bool {
 		}
 		found := false
 		tools.ForEach(func(_, tool gjson.Result) bool {
-			if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "namespace") {
+			if openAIResponsesToolDeclaresNamespace(tool) {
 				found = true
 				return false
 			}
@@ -146,6 +182,26 @@ func hasOpenAIResponsesNamespaceToolDeclaration(body []byte) bool {
 	return found
 }
 
+// openAIResponsesToolDeclaresNamespace reports whether a tool entry places its
+// functions outside the default namespace. Codex uses a type=namespace wrapper.
+// Cursor puts the same field directly on a function or custom tool; stripping
+// it from the matching function_call makes the upstream look the name up in
+// the default namespace and reject the request.
+func openAIResponsesToolDeclaresNamespace(tool gjson.Result) bool {
+	if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "namespace") {
+		return true
+	}
+	if strings.TrimSpace(tool.Get("namespace").String()) == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(tool.Get("type").String())) {
+	case "function", "custom":
+		return true
+	default:
+		return false
+	}
+}
+
 // openAIResponsesToolCallItemTypes 是携带 namespace 的调用项类型集合。与
 // removeOpenAIResponsesRejectedNamespaceAtIndex 的反应式白名单保持一致；codex-rs
 // protocol/src/models.rs 中只有 FunctionCall 与 CustomToolCall 序列化 namespace，
@@ -159,6 +215,112 @@ var openAIResponsesToolCallItemTypes = map[string]bool{
 
 func isOpenAIResponsesToolCallItemType(itemType string) bool {
 	return openAIResponsesToolCallItemTypes[strings.ToLower(strings.TrimSpace(itemType))]
+}
+
+// openAIResponsesDeclaredToolNamespaces maps a function name to the single
+// namespace that declares it. A name declared by two namespaces is omitted.
+func openAIResponsesDeclaredToolNamespaces(body []byte) map[string]string {
+	index := make(map[string]string)
+	ambiguous := make(map[string]bool)
+	add := func(name, namespace string) {
+		name = strings.TrimSpace(name)
+		namespace = strings.TrimSpace(namespace)
+		if name == "" || namespace == "" || ambiguous[name] {
+			return
+		}
+		if prev, ok := index[name]; ok && prev != namespace {
+			delete(index, name)
+			ambiguous[name] = true
+			return
+		}
+		index[name] = namespace
+	}
+	var scanTools func(tools gjson.Result)
+	scanTools = func(tools gjson.Result) {
+		if !tools.IsArray() {
+			return
+		}
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			typ := strings.ToLower(strings.TrimSpace(tool.Get("type").String()))
+			switch typ {
+			case "namespace":
+				namespace := strings.TrimSpace(tool.Get("name").String())
+				if namespace == "" {
+					namespace = strings.TrimSpace(tool.Get("namespace").String())
+				}
+				children := tool.Get("tools")
+				if !children.IsArray() {
+					children = tool.Get("children")
+				}
+				children.ForEach(func(_, child gjson.Result) bool {
+					name := strings.TrimSpace(child.Get("name").String())
+					if name == "" {
+						name = strings.TrimSpace(child.Get("function.name").String())
+					}
+					add(name, namespace)
+					return true
+				})
+			case "function", "custom":
+				name := strings.TrimSpace(tool.Get("name").String())
+				if name == "" {
+					name = strings.TrimSpace(tool.Get("function.name").String())
+				}
+				add(name, tool.Get("namespace").String())
+			}
+			return true
+		})
+	}
+	scanTools(gjson.GetBytes(body, "tools"))
+	input := gjson.GetBytes(body, "input")
+	if input.IsArray() {
+		input.ForEach(func(_, item gjson.Result) bool {
+			if strings.EqualFold(strings.TrimSpace(item.Get("type").String()), "additional_tools") {
+				scanTools(item.Get("tools"))
+			}
+			return true
+		})
+	}
+	return index
+}
+
+// ensureOpenAIResponsesToolCallNamespaces fills namespace on historical tool
+// calls that omitted it. Cursor compaction replays function_call items without
+// the field, while the tool declaration still places the name outside the
+// default namespace. Upstream then rejects the call.
+func ensureOpenAIResponsesToolCallNamespaces(body []byte) ([]byte, error) {
+	index := openAIResponsesDeclaredToolNamespaces(body)
+	if len(index) == 0 {
+		return body, nil
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body, nil
+	}
+	updated := body
+	var setErr error
+	input.ForEach(func(key, item gjson.Result) bool {
+		if setErr != nil || !item.IsObject() || !isOpenAIResponsesToolCallItemType(item.Get("type").String()) {
+			return setErr == nil
+		}
+		if strings.TrimSpace(item.Get("namespace").String()) != "" {
+			return true
+		}
+		namespace, ok := index[strings.TrimSpace(item.Get("name").String())]
+		if !ok {
+			return true
+		}
+		next, err := sjson.SetBytes(updated, "input."+key.String()+".namespace", namespace)
+		if err != nil {
+			setErr = err
+			return false
+		}
+		updated = next
+		return true
+	})
+	if setErr != nil {
+		return body, fmt.Errorf("set OpenAI tool call namespace: %w", setErr)
+	}
+	return updated, nil
 }
 
 func flattenOpenAIResponsesNamespaces(c *gin.Context, body []byte) ([]byte, error) {
