@@ -93,9 +93,11 @@ func isOpenAIAccount(account *Account) bool {
 // handleOpenAIAccountUpstreamError expects canonicalModel to be the model used
 // for scheduling after applying account mapping exactly once.
 //
-// openAICapacityShedTempUnschedApplies reports whether an explicit account rule
-// wants this capacity/overload body to pause scheduling. The default path still
-// treats capacity as request-scoped.
+// openAICapacityShedTempUnschedApplies reports whether an explicit
+// account-scoped rule wants this capacity/overload body to pause scheduling.
+// Model-scoped rules are handled by the model cooldown path above; unset-scope
+// (legacy) rules keep upstream's request-scoped default so a single overloaded
+// request cannot freeze a whole account.
 func openAICapacityShedTempUnschedApplies(account *Account, statusCode int, responseBody []byte, canonicalModel ...string) bool {
 	if account == nil || !account.IsTempUnschedulableEnabled() || len(responseBody) == 0 {
 		return false
@@ -107,7 +109,12 @@ func openAICapacityShedTempUnschedApplies(account *Account, statusCode int, resp
 	if !tempUnschedRulesApply(account, statusCode, responseBody, model) {
 		return false
 	}
-	return len(matchTempUnschedulableRules(account, statusCode, responseBody)) > 0
+	for _, match := range matchTempUnschedulableRules(account, statusCode, responseBody) {
+		if match.rule.Scope == TempUnschedScopeAccount {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte, canonicalModel ...string) bool {
@@ -122,9 +129,23 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 	// Capacity shedding describes this request, not account health. Keep the
 	// account schedulable while the request-local retry budget handles recovery,
 	// unless the account has an explicit temp-unschedulable rule for this body.
-	if account != nil && account.Platform == PlatformOpenAI && isOpenAIRequestScopedCapacityShed("", responseBody) &&
-		!openAICapacityShedTempUnschedApplies(account, statusCode, responseBody, canonicalModel...) {
-		return false
+	if account != nil && account.Platform == PlatformOpenAI && isOpenAIRequestScopedCapacityShed("", responseBody) {
+		// An explicit model-scoped rule overrides the default retry policy without
+		// turning a request-level overload into an account-wide health failure.
+		model := firstRequestedModel(canonicalModel)
+		if s != nil && s.rateLimitService != nil && model != "" && account.IsTempUnschedulableEnabled() {
+			ruleBody := openAICapacityShedRuleBody(responseBody)
+			matches := matchTempUnschedulableRules(account, statusCode, ruleBody)
+			if len(matches) > 0 && matches[0].rule.Scope == TempUnschedScopeModel {
+				stateCtx, cancel := openAIAccountStateContext(ctx)
+				defer cancel()
+				return s.rateLimitService.HandleTempUnschedulable(stateCtx, account, statusCode, ruleBody, model)
+			}
+		}
+		// Account-scoped rules still want this body to pause scheduling.
+		if !openAICapacityShedTempUnschedApplies(account, statusCode, responseBody, canonicalModel...) {
+			return false
+		}
 	}
 	stateCtx, cancel := openAIAccountStateContext(ctx)
 	defer cancel()
