@@ -214,18 +214,20 @@ func restoreInheritedResponsesClientToolDeclarations(lowered []any, mapping Resp
 		switch {
 		case mapping.ToolSearch && name == toolSearchProxyName:
 			restored = append(restored, map[string]any{"type": "tool_search"})
-		case mapping.CustomTools[name]:
-			copy := copyClientTool(tool)
-			copy["type"] = "custom"
-			restored = append(restored, copy)
 		case mapping.NamespaceTools[name].Namespace != "":
 			identity := mapping.NamespaceTools[name]
 			child := copyClientTool(tool)
-			child["type"] = "function"
+			if mapping.CustomTools[name] {
+				child["type"] = "custom"
+			}
 			child["name"] = identity.Name
 			restored = append(restored, map[string]any{
 				"type": "namespace", "name": identity.Namespace, "tools": []any{child},
 			})
+		case mapping.CustomTools[name]:
+			copy := copyClientTool(tool)
+			copy["type"] = "custom"
+			restored = append(restored, copy)
 		default:
 			restored = append(restored, copyClientTool(tool))
 		}
@@ -250,11 +252,12 @@ func responsesNamespaceToolDiscovery(tool map[string]any) (map[string]any, []res
 	copy["name"] = namespace
 	identities := make([]responsesNamespaceToolCandidate, 0, len(children))
 	for _, rawChild := range children {
-		child, ok := rawChild.(map[string]any)
-		if !ok || strings.TrimSpace(stringValue(child["type"])) != "function" {
+		child, _ := rawChild.(map[string]any)
+		kind := strings.TrimSpace(stringValue(child["type"]))
+		if kind != "function" && kind != "custom" {
 			continue
 		}
-		childCopy, direct, ok := responsesDirectToolDiscovery(child, "function")
+		childCopy, direct, ok := responsesDirectToolDiscovery(child, kind)
 		if !ok {
 			continue
 		}

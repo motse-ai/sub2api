@@ -188,23 +188,16 @@ func AdaptResponsesClientToolsWithInheritedMapping(
 		return AdaptResponsesClientTools(req)
 	}
 
+	namesChanged := false
+	if len(inherited.NamespaceTools) > 0 {
+		namesChanged = rewriteNamespaceQualifiedCalls(req["input"], inherited.NamespaceTools)
+		namesChanged = rewriteNamespaceToolChoice(req, inherited.NamespaceTools, nil) || namesChanged
+	}
 	changed, err := rewriteClientToolHistory(req["input"], &inherited)
 	if err != nil {
 		return ResponsesClientToolMapping{}, false, err
 	}
-	if len(inherited.NamespaceTools) > 0 {
-		before := changed
-		rewriteNamespaceQualifiedCalls(req["input"], inherited.NamespaceTools)
-		// Namespace rewriting does not currently report whether it changed a
-		// value. A retained namespace mapping is only used for follow-up
-		// history, so conservatively rebuild the request when input exists.
-		if _, inputPresent := req["input"]; inputPresent && !before {
-			changed = true
-		}
-	}
-	if rewriteClientToolChoice(req, &inherited) {
-		changed = true
-	}
+	changed = rewriteClientToolChoice(req, &inherited) || namesChanged || changed
 	return inherited, changed, nil
 }
 
@@ -616,7 +609,7 @@ func (r *ResponsesClientToolStreamRestorer) Restore(event ResponsesStreamEvent) 
 				if input != "" {
 					emit(ResponsesStreamEvent{Type: "response.custom_tool_call_input.delta", OutputIndex: call.outputIdx, ItemID: call.clientItemID, Delta: input})
 				}
-				emit(ResponsesStreamEvent{Type: "response.custom_tool_call_input.done", OutputIndex: call.outputIdx, ItemID: call.clientItemID, CallID: call.callID, Name: call.name, Input: input})
+				emit(r.restoreNamespaceEvent(ResponsesStreamEvent{Type: "response.custom_tool_call_input.done", OutputIndex: call.outputIdx, ItemID: call.clientItemID, CallID: call.callID, Name: call.name, Input: input}))
 			}
 			return out
 		}
@@ -845,12 +838,12 @@ func (r *ResponsesClientToolStreamRestorer) restoreNamespaceEvent(event Response
 	if len(r.adapter.NamespaceTools) == 0 {
 		return event
 	}
-	if event.Item != nil && event.Item.Type == "function_call" {
+	if event.Item != nil && (event.Item.Type == "function_call" || event.Item.Type == "custom_tool_call") {
 		if name, ok := r.adapter.NamespaceTools[event.Item.Name]; ok {
 			event.Item.Name, event.Item.Namespace = name.Name, name.Namespace
 		}
 	}
-	if event.Type == "response.function_call_arguments.delta" || event.Type == "response.function_call_arguments.done" {
+	if event.Type == "response.function_call_arguments.delta" || event.Type == "response.function_call_arguments.done" || event.Type == "response.custom_tool_call_input.done" {
 		if name, ok := r.adapter.NamespaceTools[event.Name]; ok {
 			event.Name = name.Name
 		}
@@ -876,7 +869,7 @@ func restoreResponsesOutputClientTools(outputs []ResponsesOutput, adapter *Respo
 			output.Name = ""
 			output.Namespace = ""
 		}
-		if name, ok := adapter.NamespaceTools[output.Name]; ok && output.Type == "function_call" {
+		if name, ok := adapter.NamespaceTools[output.Name]; ok && (output.Type == "function_call" || output.Type == "custom_tool_call") {
 			output.Name, output.Namespace = name.Name, name.Namespace
 		}
 	}
