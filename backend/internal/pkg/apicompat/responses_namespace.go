@@ -88,15 +88,22 @@ func FlattenResponsesNamespacesExcept(req map[string]any, preserved map[string]b
 	}
 	req["tools"] = flattened
 	rewriteNamespaceQualifiedCalls(req["input"], names)
-	if choice, ok := req["tool_choice"].(map[string]any); ok {
-		choiceNamespace := strings.TrimSpace(stringValue(choice["name"]))
-		if strings.TrimSpace(stringValue(choice["type"])) == "namespace" && !preserved[choiceNamespace] {
-			req["tool_choice"] = "auto"
-		} else {
-			rewriteNamespaceQualifiedCall(choice, names)
-		}
-	}
+	rewriteNamespaceToolChoice(req, names, preserved)
 	return names, true, nil
+}
+
+func rewriteNamespaceToolChoice(req map[string]any, names map[string]ResponsesNamespaceName, preserved map[string]bool) bool {
+	choice, ok := req["tool_choice"].(map[string]any)
+	if !ok {
+		return false
+	}
+	choiceNamespace := strings.TrimSpace(stringValue(choice["name"]))
+	if strings.TrimSpace(stringValue(choice["type"])) == "namespace" && !preserved[choiceNamespace] {
+		// Flattened tools can be selected individually, but their group no longer exists upstream.
+		req["tool_choice"] = "auto"
+		return true
+	}
+	return rewriteNamespaceQualifiedCall(choice, names)
 }
 
 // RestoreResponsesNamespaceCalls restores flattened function calls in a JSON

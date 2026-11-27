@@ -728,11 +728,16 @@ func TestNamespacedCustomToolRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, changed)
 	require.True(t, mapping.CustomTools[flat])
-	lowered := req["tools"].([]any)
+	lowered, ok := req["tools"].([]any)
+	require.True(t, ok)
 	require.Len(t, lowered, 2)
-	require.Equal(t, "function", lowered[0].(map[string]any)["type"])
-	require.Equal(t, flat, lowered[0].(map[string]any)["name"])
-	require.Equal(t, "functions__wait", lowered[1].(map[string]any)["name"])
+	execTool, ok := lowered[0].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "function", execTool["type"])
+	require.Equal(t, flat, execTool["name"])
+	waitTool, ok := lowered[1].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "functions__wait", waitTool["name"])
 
 	wire := ResponsesOutput{Type: "function_call", ID: "fc_1", CallID: "call_1", Name: flat, Arguments: customToolCallArguments(code)}
 	expected := ResponsesOutput{Type: "custom_tool_call", ID: "ctc_1", CallID: "call_1", Name: "exec", Namespace: "functions", Input: code}
@@ -768,9 +773,10 @@ func TestNamespacedCustomToolRoundTrip(t *testing.T) {
 			choice := map[string]any{"type": "custom", "namespace": "functions", "name": "exec"}
 			follow := map[string]any{"input": []any{history, output}, "tool_choice": choice}
 			var declarations [][]any
-			if variant == "explicit" {
+			switch variant {
+			case "explicit":
 				follow["tools"] = tools
-			} else if variant == "inherited with declarations" {
+			case "inherited with declarations":
 				declarations = append(declarations, lowered)
 			}
 			next, _, err := AdaptResponsesClientToolsWithInheritedMapping(follow, mapping, declarations...)
@@ -784,6 +790,26 @@ func TestNamespacedCustomToolRoundTrip(t *testing.T) {
 			require.Equal(t, map[string]any{"type": "function", "name": flat}, choice)
 		})
 	}
+}
+
+func TestInheritedNamespaceGroupChoiceFallsBackToAuto(t *testing.T) {
+	groupChoice := map[string]any{"type": "namespace", "name": "functions"}
+	first := map[string]any{
+		"tools": []any{map[string]any{"type": "namespace", "name": "functions", "tools": []any{
+			map[string]any{"type": "custom", "name": "exec"},
+		}}},
+		"tool_choice": groupChoice,
+	}
+	mapping, _, err := AdaptResponsesClientTools(first)
+	require.NoError(t, err)
+	require.Equal(t, "auto", first["tool_choice"])
+
+	follow := map[string]any{"tool_choice": groupChoice}
+	_, changed, err := AdaptResponsesClientToolsWithInheritedMapping(follow, mapping)
+	require.NoError(t, err)
+	require.Equal(t, "auto", follow["tool_choice"])
+	require.True(t, changed)
+	require.NotContains(t, follow, "tools")
 }
 
 func TestNamespacedCustomToolRejectsSameNamedFunction(t *testing.T) {

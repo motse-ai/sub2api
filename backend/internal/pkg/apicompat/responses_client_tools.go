@@ -191,9 +191,7 @@ func AdaptResponsesClientToolsWithInheritedMapping(
 	namesChanged := false
 	if len(inherited.NamespaceTools) > 0 {
 		namesChanged = rewriteNamespaceQualifiedCalls(req["input"], inherited.NamespaceTools)
-		if choice, ok := req["tool_choice"].(map[string]any); ok {
-			namesChanged = rewriteNamespaceQualifiedCall(choice, inherited.NamespaceTools) || namesChanged
-		}
+		namesChanged = rewriteNamespaceToolChoice(req, inherited.NamespaceTools, nil) || namesChanged
 	}
 	changed, err := rewriteClientToolHistory(req["input"], &inherited)
 	if err != nil {
