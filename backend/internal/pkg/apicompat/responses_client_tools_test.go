@@ -715,3 +715,81 @@ func TestResponsesClientToolStreamRestorer_RestoresAllTerminalEvents(t *testing.
 		})
 	}
 }
+
+func TestNamespacedCustomToolRoundTrip(t *testing.T) {
+	const code = "const r = await tools.exec_command({cmd: 'pwd'});\ntext(r.output)"
+	const flat = "functions__exec"
+	tools := []any{map[string]any{"type": "namespace", "name": "functions", "tools": []any{
+		map[string]any{"type": "custom", "name": "exec", "format": map[string]any{"type": "text"}},
+		map[string]any{"type": "function", "name": "wait"},
+	}}}
+	req := map[string]any{"tools": tools}
+	mapping, changed, err := AdaptResponsesClientTools(req)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.True(t, mapping.CustomTools[flat])
+	lowered := req["tools"].([]any)
+	require.Len(t, lowered, 2)
+	require.Equal(t, "function", lowered[0].(map[string]any)["type"])
+	require.Equal(t, flat, lowered[0].(map[string]any)["name"])
+	require.Equal(t, "functions__wait", lowered[1].(map[string]any)["name"])
+
+	wire := ResponsesOutput{Type: "function_call", ID: "fc_1", CallID: "call_1", Name: flat, Arguments: customToolCallArguments(code)}
+	expected := ResponsesOutput{Type: "custom_tool_call", ID: "ctc_1", CallID: "call_1", Name: "exec", Namespace: "functions", Input: code}
+	raw, err := json.Marshal(wire)
+	require.NoError(t, err)
+	restored, _, err := RestoreResponsesClientToolPayload(raw, mapping)
+	require.NoError(t, err)
+	var item ResponsesOutput
+	require.NoError(t, json.Unmarshal(restored, &item))
+	require.Equal(t, expected, item)
+
+	stream := NewResponsesClientToolStreamRestorer(mapping)
+	added := wire
+	added.Arguments = ""
+	start := stream.Restore(ResponsesStreamEvent{Type: "response.output_item.added", Item: &added})
+	require.Equal(t, "functions", start[0].Item.Namespace)
+	require.Equal(t, "exec", start[0].Item.Name)
+	done := stream.Restore(ResponsesStreamEvent{Type: "response.function_call_arguments.done", ItemID: wire.ID, Arguments: wire.Arguments})
+	require.Len(t, done, 2)
+	require.Equal(t, "exec", done[1].Name)
+	require.Equal(t, code, done[1].Input)
+	endItem := wire
+	end := stream.Restore(ResponsesStreamEvent{Type: "response.output_item.done", Item: &endItem})
+	require.Equal(t, expected, *end[0].Item)
+	terminal := stream.Restore(ResponsesStreamEvent{Type: "response.completed", Response: &ResponsesResponse{Output: []ResponsesOutput{wire}}})
+	require.Equal(t, expected, terminal[0].Response.Output[0])
+
+	for _, variant := range []string{"explicit", "inherited", "inherited with declarations"} {
+		t.Run(variant, func(t *testing.T) {
+			var history map[string]any
+			require.NoError(t, json.Unmarshal(restored, &history))
+			output := map[string]any{"type": "custom_tool_call_output", "call_id": "call_1", "output": "ok"}
+			choice := map[string]any{"type": "custom", "namespace": "functions", "name": "exec"}
+			follow := map[string]any{"input": []any{history, output}, "tool_choice": choice}
+			var declarations [][]any
+			if variant == "explicit" {
+				follow["tools"] = tools
+			} else if variant == "inherited with declarations" {
+				declarations = append(declarations, lowered)
+			}
+			next, _, err := AdaptResponsesClientToolsWithInheritedMapping(follow, mapping, declarations...)
+			require.NoError(t, err)
+			require.Equal(t, mapping, next)
+			require.Equal(t, flat, history["name"])
+			require.Equal(t, "function_call", history["type"])
+			require.Equal(t, wire.Arguments, history["arguments"])
+			require.Equal(t, "function_call_output", output["type"])
+			require.Equal(t, wire.CallID, output["call_id"])
+			require.Equal(t, map[string]any{"type": "function", "name": flat}, choice)
+		})
+	}
+}
+
+func TestNamespacedCustomToolRejectsSameNamedFunction(t *testing.T) {
+	req := map[string]any{"tools": []any{map[string]any{"type": "namespace", "name": "functions", "tools": []any{
+		map[string]any{"type": "custom", "name": "exec"}, map[string]any{"type": "function", "name": "exec"},
+	}}}}
+	_, _, err := AdaptResponsesClientTools(req)
+	require.ErrorContains(t, err, "both flatten")
+}
